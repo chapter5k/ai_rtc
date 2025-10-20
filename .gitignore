@@ -1,0 +1,17 @@
+# Python 가상 환경
+.venv/
+venv/
+*.env
+
+# Python 캐시
+__pycache__/
+*.pyc
+
+# IDE/Editor
+.vscode/
+.idea/
+
+# 결과물
+outputs/
+*.csv
+*.log
