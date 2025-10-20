@@ -35,7 +35,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import warnings
 
+warnings.filterwarnings(
+    "ignore",
+    message="The least populated class in y has only .* members,.*less than n_splits=",
+    category=UserWarning,
+    module="sklearn.model_selection._split",
+)
 # ----------------------------- 유틸리티 -----------------------------
 
 def set_seed(seed: int = 1234):
@@ -120,13 +127,21 @@ def compute_pS0_stat(
         rf.fit(X, y)
         oob = getattr(rf, 'oob_decision_function_', None)
         if oob is None:
-            raise RuntimeError('sklearn RF must expose oob_decision_function_')
-        return float(np.mean(oob[idx_S0, 0]))
+            # oob_score=False로 설정되었거나 샘플이 너무 적어 oob가 없는 경우 fallback
+            X_S0_np = X[idx_S0]
+            if X_S0_np.ndim == 1:
+                X_S0_np = X_S0_np.reshape(1, -1)
+            proba = rf.predict_proba(X_S0_np)
+            return float(np.mean(proba[:, 0]))
+        
+        p0 = oob[idx_S0, 0]
+        return float(np.nanmean(p0)) # S0 샘플이 OOB에 한 번도 안 잡히면 nan이 뜰 수 있음
+
     elif backend == 'cuml_cv':
         try:
             import cupy as cp
             from cuml.ensemble import RandomForestClassifier as cuRF
-            from sklearn.model_selection import StratifiedKFold   # ← 변경
+            from sklearn.model_selection import StratifiedKFold
         except Exception as e:
             raise RuntimeError("cuML이 설치되어 있어야 backend='cuml_cv'를 사용할 수 있습니다. conda로 RAPIDS를 설치하세요.") from e
 
@@ -135,51 +150,97 @@ def compute_pS0_stat(
 
         # --- 핵심 가드: 소수 클래스 개수에 맞춰 n_splits를 안전하게 줄임
         class_counts = np.bincount(y_np, minlength=2)
-        min_class = int(class_counts.min())  # 소수 클래스 개수
-        # StratifiedKFold는 각 클래스 샘플수가 n_splits 이상이어야 함
-        n_splits = max(2, min(kfold, min_class))  # 예: window=5면 최대 5-fold
+        min_class = int(class_counts.min())
+
+        # --- Case A: 소수 클래스가 2 미만 → CV 불가 → 공정한 백업으로 sklearn OOB 사용 ---
+        if min_class < 2:
+            # sklearn OOB로 편향을 낮춰서 pS0 추정
+            from sklearn.ensemble import RandomForestClassifier as skRF
+
+            sk = skRF(
+                n_estimators=n_estimators,
+                max_features=max(1, int(np.sqrt(X_np.shape[1]))),
+                bootstrap=True,
+                oob_score=True,
+                random_state=seed,
+                n_jobs=-1,
+            )
+            sk.fit(X_np, y_np)
+
+            # OOB 확률이 있으면 그걸 사용 (없으면 predict_proba fallback)
+            if getattr(sk, "oob_decision_function_", None) is not None:
+                oob = sk.oob_decision_function_  # shape: (N, n_classes)
+                p0 = oob[idx_S0, 0]
+                return float(np.nanmean(p0)) # S0 샘플이 OOB에 한 번도 안 잡히면 nan
+            else:
+                # 안전 fallback: S0만 별도 예측 (1D→2D 가드)
+                X_S0_np = X_np[idx_S0]
+                if X_S0_np.ndim == 1:
+                    X_S0_np = X_S0_np.reshape(1, -1)
+                proba = sk.predict_proba(X_S0_np)
+                return float(np.mean(proba[:, 0]))
+
+        # --- Case B: CV 가능 → cuML StratifiedKFold로 안정화 ---
+        n_splits = max(2, min(kfold, min_class))  # kfold(기본5)와 min_class 중 작은 값
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
         p0_vals = []
         for tr_idx, te_idx in skf.split(X_np, y_np):
-            # 학습 세트가 단일 클래스인지 체크 (희귀 케이스지만 방어)
             y_tr_np = y_np[tr_idx]
             if np.unique(y_tr_np).size < 2:
-                continue  # 이 폴드는 스킵
+                continue  # 학습세트가 단일클래스면 건너뜀
 
+            # 학습(cuML)
             X_tr = cp.asarray(X_np[tr_idx]); y_tr = cp.asarray(y_tr_np)
             model = cuRF(
                 n_estimators=n_estimators,
-                max_features=sqrt_int(d),
+                max_features=max(1, int(np.sqrt(X_np.shape[1]))),
                 bootstrap=True,
-                n_streams=1,          # 재현성을 위해 경고가 안내한 설정(선택)
+                n_streams=1,             # 재현성 향상
                 random_state=seed,
             )
             model.fit(X_tr, y_tr)
 
+            # 테스트에서 S0 위치만 뽑아 확률 취합
             te_S0_mask = np.isin(te_idx, idx_S0)
             te_S0_idx = te_idx[te_S0_mask]
-            if len(te_S0_idx) == 0:
+            if te_S0_idx.size == 0:
                 continue
-            X_te = cp.asarray(X_np[te_S0_idx])
-            proba = model.predict_proba(X_te)
-            p0 = cp.asnumpy(proba)[:, 0]
-            p0_vals.append(p0)
+            
+            # --- 1D→2D 런타임 에러 방지 가드 (필수) ---
+            X_te_np = X_np[te_S0_idx]
+            if X_te_np.ndim == 1:
+                X_te_np = X_te_np.reshape(1, -1)
+            X_te = cp.asarray(X_te_np)
+            # ----------------------------------------
 
-        # 모든 폴드가 스킵되었거나 S0가 테스트에 하나도 안 걸렸다면, 풀데이터로 백업 추정
+            proba = model.predict_proba(X_te)
+            p0_vals.append(cp.asnumpy(proba)[:, 0])
+
         if not p0_vals:
-            X_S0 = cp.asarray(X_np[idx_S0])
-            model = cuRF(
+            # 극단 케이스: 모든 폴드 스킵 → Case A와 동일한 sklearn OOB로 백업
+            from sklearn.ensemble import RandomForestClassifier as skRF
+            sk = skRF(
                 n_estimators=n_estimators,
-                max_features=sqrt_int(d),
+                max_features=max(1, int(np.sqrt(X_np.shape[1]))),
                 bootstrap=True,
-                n_streams=1,
+                oob_score=True,
                 random_state=seed,
+                n_jobs=-1,
             )
-            model.fit(cp.asarray(X_np), cp.asarray(y_np))
-            proba = model.predict_proba(X_S0)
-            return float(np.mean(cp.asnumpy(proba)[:, 0]))
+            sk.fit(X_np, y_np)
+            oob = getattr(sk, "oob_decision_function_", None)
+            if oob is not None:
+                return float(np.nanmean(oob[idx_S0, 0]))
+            else:
+                X_S0_np = X_np[idx_S0]
+                if X_S0_np.ndim == 1:
+                    X_S0_np = X_S0_np.reshape(1, -1)
+                proba = sk.predict_proba(X_S0_np)
+                return float(np.mean(proba[:, 0]))
+
         return float(np.mean(np.concatenate(p0_vals)))
+
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -316,9 +377,13 @@ def train_rl_policy(
         else:
             scenario = 'II'; lam = float(rng.choice(lam_choices_II))
         X, labels_ic = make_phase2_series(scen, rng, scenario, lam)
+        a_trace: List[int] = [] # 에피소드 행동 로깅
+        logps: List[torch.Tensor] = []            
+        
         pbar_ep.set_description(f"[RL] Ep {ep+1}/{cfg.episodes} (scen={scenario}, lam={lam:.2f})")
         logps: List[torch.Tensor] = []
         rewards: List[float] = []
+        a_trace: List[int] = [] # 에피소드 행동 로깅
         for t in range(1, scen.T + 1):
             pbar_ep.set_postfix_str(f"t={t}/{scen.T}")
             ms_list, D_list = [], []
@@ -338,10 +403,15 @@ def train_rl_policy(
             logits = policy(state)
             probs = torch.softmax(logits, dim=-1)
             m = torch.distributions.Categorical(probs=probs)
-            a_idx = int(m.sample().item())
-            logps.append(m.log_prob(torch.tensor(a_idx, device=device)))
+            a_idx_tensor = m.sample()
+            a_idx = int(a_idx_tensor.item())
+
+            a_trace.append(actions[a_idx]) # 행동 로깅
+            
+            logps.append(m.log_prob(a_idx_tensor))
             ic = bool(labels_ic[t-1] == 1)
             rewards.append(float(reward_by_algorithm1(a_idx, D_list, in_control=ic)))
+        
         pbar_ep.set_postfix_str("Updating policy...")
         G = 0.0
         returns = []
@@ -358,7 +428,24 @@ def train_rl_policy(
         optimizer.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
+        
+        # --- 여기부터: 10 에피소드마다 요약 로그 출력 ---
+        if every(10, ep):
+            avg_r = float(np.mean(rewards)) if len(rewards) else 0.0
+            if len(a_trace):
+                vals, counts = np.unique(a_trace, return_counts=True)
+                pi_hist = {int(v): f"{float(c)/float(len(a_trace)):.2f}" for v, c in zip(vals, counts)}
+            else:
+                pi_hist = {}
+            print(f"\n[ep {ep+1}] avg_reward={avg_r:.3f}  pi(w)={pi_hist}")
+        # -----------------------------------------------
+    
     pbar_ep.set_postfix_str("Done"); pbar_ep.close()
+    
+    # DataParallel 래퍼 해제 (학습이 완료되었으므로)
+    if isinstance(policy, nn.DataParallel):
+        policy = policy.module
+        
     return policy
 
 
@@ -374,7 +461,7 @@ def run_length_until_alarm(
     rf_backend: str = 'sklearn',
 ) -> int:
     policy.eval()
-    device = next(policy.parameters()).device if not isinstance(policy, nn.DataParallel) else next(policy.module.parameters()).device
+    device = next(policy.parameters()).device
     T = len(X)
     for t in range(1, T + 1):
         Lmax = 15
@@ -394,6 +481,8 @@ def run_length_until_alarm(
             return t
     return T
 
+def every(n, i):  # i: 0-based index
+    return (i + 1) % n == 0
 
 def evaluate_arl1(
     scen_cfg: ScenarioConfig,
@@ -496,7 +585,8 @@ def main():
     for i in pbar_bench:
         bench_times_300.append(_run_benchmark_rf(S0_ref_bench, scen.d, n_estimators=300, seed=args.seed + i, backend=args.rf_backend))
     avg_rf_300_time = float(np.mean(bench_times_300))
-    avg_rf_200_time = avg_rf_300_time * (200.0 / 300.0)
+    # n=200 RF는 n=300 RF 시간의 (200/300) 근사
+    avg_rf_200_time = avg_rf_300_time * (200.0 / 300.0) 
 
     lam_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
     lam_II = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
@@ -570,8 +660,12 @@ def main():
 
     out_dir = os.path.abspath('./outputs')
     os.makedirs(out_dir, exist_ok=True)
-    np.savetxt(os.path.join(out_dir, f'arl1_scenI_{"-".join(map(str,actions))}.csv'), np.c_[lam_I, mean_I, std_I], delimiter=',', header='lambda,arl1_mean,arl1_std', comments='')
-    np.savetxt(os.path.join(out_dir, f'arl1_scenII_{"-".join(map(str,actions))}.csv'), np.c_[lam_II, mean_II, std_II], delimiter=',', header='lambda,arl1_mean,arl1_std', comments='')
+    # 타임스탬프를 파일명에 추가하여 겹치지 않게 저장
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    action_str = "-".join(map(str,actions))
+    
+    np.savetxt(os.path.join(out_dir, f'arl1_scenI_{action_str}_{ts}.csv'), np.c_[lam_I, mean_I, std_I], delimiter=',', header='lambda,arl1_mean,arl1_std', comments='')
+    np.savetxt(os.path.join(out_dir, f'arl1_scenII_{action_str}_{ts}.csv'), np.c_[lam_II, mean_II, std_II], delimiter=',', header='lambda,arl1_mean,arl1_std', comments='')
     print(f"[저장 완료] outputs/arl1_scenI_*.csv, outputs/arl1_scenII_*.csv")
 
     end_time = datetime.now()
