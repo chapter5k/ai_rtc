@@ -18,6 +18,8 @@ import os
 import random
 from dataclasses import dataclass
 from typing import Tuple, List, Dict
+import time  # <--- [신규] 벤치마크용
+from datetime import datetime, timedelta  # <--- [수정] ETA 계산용
 
 import numpy as np
 from numpy.typing import NDArray
@@ -43,11 +45,11 @@ def sqrt_int(x: float) -> int:
 # ------------------------- 데이터 생성부 -----------------------------
 @dataclass
 class ScenarioConfig:
-    d: int = 10                 # 변수(센서) 차원
-    N0: int = 1500              # 참조데이터(Phase I) 크기
-    T: int = 300                # Phase II 길이 (한 에피소드 길이)
-    shift_time: int = 100       # t >= shift_time 부터 OOC
-    sigma: float = 1.0          # 공분산은 I (단위분산) 가정
+    d: int = 10             # 변수(센서) 차원
+    N0: int = 1500          # 참조데이터(Phase I) 크기
+    T: int = 300            # Phase II 길이 (한 에피소드 길이)
+    shift_time: int = 100   # t >= shift_time 부터 OOC
+    sigma: float = 1.0      # 공분산은 I (단위분산) 가정
 
 
 def make_cov(d: int) -> NDArray:
@@ -79,7 +81,7 @@ def make_phase2_series(cfg: ScenarioConfig, rng: np.random.RandomState,
     if scenario.upper() == 'I':
         # 한 변수만 shift, 크기 lam
         delta = np.zeros(cfg.d)
-        j = 0  # 첫 번째 변수에 시프트
+        j = 0   # 첫 번째 변수에 시프트
         delta[j] = lam
     else:
         # 여러 변수에 동일크기 분배: lam^2 = k*(a^2) => a = lam/sqrt(k)
@@ -205,11 +207,7 @@ class RLConfig:
     gamma: float = 0.99
     episodes: int = 50
     device: str = 'cpu'
-    action_set: Tuple[int, int, int] = (5, 10, 15)  # 또는 (3,10,17)
-    lr: float = 1e-3
-    gamma: float = 0.99
-    episodes: int = 50
-    device: str = 'cpu'
+    # <--- [수정] 중복 정의 제거
 
 
 # ------------------------ 상태 구성 & 보상 계산 ------------------------
@@ -394,9 +392,38 @@ def evaluate_arl1(
     return arl_means, arl_stds
 
 
+# ----------------------------- (신규) 벤치마크 ----------------------------
+
+def _run_benchmark_rf(S0_ref: NDArray, d: int, n_estimators: int, seed: int) -> float:
+    """
+    단일 RF 호출 시간을 벤치마킹하기 위한 헬퍼 함수
+    """
+    rng_bench = check_random_state(seed)
+    w_bench = 10  # 벤치마크용 중간 윈도우 크기
+    
+    # CL/ARL1 평가와 동일한 데이터셋 구성
+    start_idx = rng_bench.randint(0, len(S0_ref) - w_bench)
+    Sw = S0_ref[start_idx : start_idx + w_bench]
+    X = np.vstack([S0_ref, Sw])
+    y = np.hstack([np.zeros(len(S0_ref), dtype=int), np.ones(len(Sw), dtype=int)])
+    
+    # 시간 측정
+    start_t = time.perf_counter()
+    train_rf_with_oob(
+        X, y, 
+        n_estimators=n_estimators, 
+        mtry=sqrt_int(d), 
+        seed=rng_bench.randint(1_000_000)
+    )
+    end_t = time.perf_counter()
+    return end_t - start_t
+
+
 # ------------------------------- 메인 -------------------------------
 
 def main():
+    start_time = datetime.now()  # <--- [신규] 전체 실행 시작 시간
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=2025)
     parser.add_argument('--device', type=str, default='cpu')
@@ -409,33 +436,103 @@ def main():
     set_seed(args.seed)
     device = args.device
     action_set = tuple(int(x) for x in args.action_set.split(','))
+    actions = list(action_set) # <--- [신규] actions 리스트 미리 생성
 
     # 설정
     scen = ScenarioConfig()
     rl_cfg = RLConfig(action_set=action_set, device=device, episodes=args.episodes)
 
+    # -----------------------------------------------------------------
+    # <--- [신규] ETA 추정 로직 (시작)
+    # -----------------------------------------------------------------
+    print("[ETA] 스크립트 시작. 예상 완료 시간(ETA)을 위해 벤치마크를 수행합니다...")
+    
+    # 1. 벤치마크용 S0 생성 (어차피 나중에 CL/ARL1에서도 필요함)
+    rng_s0 = check_random_state(args.seed)
+    S0_ref_bench = gen_reference_data(scen, rng_s0)
+    
+    # 2. 벤치마크 실행 (RF(300)과 RF(200) 두 종류가 있음)
+    N_BENCH_RUNS = 20 # 48코어에서 20회는 금방 끝남
+    
+    bench_times_300 = []
+    for i in range(N_BENCH_RUNS):
+        bench_times_300.append(
+            _run_benchmark_rf(S0_ref_bench, scen.d, n_estimators=300, seed=args.seed + i)
+        )
+    avg_rf_300_time = np.mean(bench_times_300)
+    
+    # RF(200)은 RF(300) 시간에 비례하여 추정
+    avg_rf_200_time = avg_rf_300_time * (200 / 300)
+
+    # 3. 총 RF 호출 횟수 계산
+    
+    # (Step 1: CL 보정)
+    calls_cl = len(actions) * args.n_boot
+    time_cl = calls_cl * avg_rf_300_time
+    
+    # (Step 2: RL 학습)
+    calls_rl = args.episodes * scen.T * len(actions)
+    time_rl = calls_rl * avg_rf_200_time
+    
+    # (Step 3: ARL1 평가)
+    lam_I_eta = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
+    lam_II_eta = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
+    total_lam_runs = len(lam_I_eta) + len(lam_II_eta) # 13
+    
+    # *** 가장 큰 추정치 ***
+    # ARL1은 결과값이지만, 예측을 위해선 평균값을 가정해야 함
+    # 논문 결과(Table 2~5)의 ARL1 값들을 대략 평균내면 약 15 정도임
+    GUESSED_AVG_ARL1 = 15 
+    
+    calls_arl1 = total_lam_runs * args.R * GUESSED_AVG_ARL1
+    time_arl1 = calls_arl1 * avg_rf_300_time
+    
+    # 4. 총 시간 및 ETA 계산
+    total_estimated_seconds = time_cl + time_rl + time_arl1
+    finish_time_eta = start_time + timedelta(seconds=total_estimated_seconds)
+
+    print("--------------------------------------------------")
+    print(f"[ETA] 벤치마크 완료 (CPU 코어 수에 따라 시간 다름)")
+    print(f"  - RF(n=300) 1회 평균 시간: {avg_rf_300_time:.4f} 초")
+    print(f"  - RF(n=200) 1회 평균 시간: {avg_rf_200_time:.4f} 초")
+    print("\n[ETA] 예상 작업량 (RF 호출 횟수)")
+    print(f"  - (1) CL 보정 : {calls_cl:10,d} 회 (예상 {timedelta(seconds=time_cl)})")
+    print(f"  - (2) RL 학습 : {calls_rl:10,d} 회 (예상 {timedelta(seconds=time_rl)})")
+    print(f"  - (3) ARL1 평가: {calls_arl1:10,d} 회 (가정 ARL1={GUESSED_AVG_ARL1}) (예상 {timedelta(seconds=time_arl1)})")
+    print("--------------------------------------------------")
+    print(f"[ETA] 총 예상 소요 시간 : {timedelta(seconds=total_estimated_seconds)}")
+    print(f"[ETA] 예상 완료 시간 (ETA): {finish_time_eta.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("--------------------------------------------------\n")
+    # -----------------------------------------------------------------
+    # <--- [신규] ETA 추정 로직 (종료)
+    # -----------------------------------------------------------------
+
     # Phase I 참조데이터 고정 및 CL 보정 (각 윈도우에 대해)
-    rng = check_random_state(args.seed)
-    S0_ref = gen_reference_data(scen, rng)
+    # rng = check_random_state(args.seed) # <--- [수정] ETA 로직에서 이미 생성함
+    # S0_ref = gen_reference_data(scen, rng) # <--- [수정] ETA 로직에서 이미 생성함
+    S0_ref = S0_ref_bench # <--- [신규] 벤치마크에서 생성한 S0_ref 재사용
 
     calib_map: Dict[int, WindowCalib] = {}
+    print(f"[작업 1/3] CL(ARL0=200) 보정 시작... (n_boot={args.n_boot})") # <--- [신규] 진행 상황
     for w in action_set:
-        calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng.randint(1_000_000))
+        calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng_s0.randint(1_000_000)) # <--- [수정] rng_s0 사용
         calib_map[w] = WindowCalib(CL=calib.CL, std=calib.std_boot, size=w)
         print(f"[CL] window={w:2d} -> CL={calib.CL:.5f}, std={calib.std_boot:.5f}")
 
     # RL 정책 초기화 & 학습
+    print(f"\n[작업 2/3] RL 정책 학습 시작... (episodes={args.episodes})") # <--- [신규] 진행 상황
     policy = PolicyCNN(d=scen.d, num_actions=3)
     optimizer = optim.Adam(policy.parameters(), lr=rl_cfg.lr)
     policy = train_rl_policy(policy, optimizer, rl_cfg, scen, calib_map, S0_ref, seed=args.seed)
 
-    actions = list(action_set)
+    # actions = list(action_set) # <--- [수정] main 함수 상단으로 이동
 
     # 평가 세트 (논문 값과 동일한 루트값 리스트)
     lam_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
     lam_II = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
 
     # 시나리오 I 평가
+    print(f"\n[작업 3/3] ARL1 평가 시작... (R={args.R})") # <--- [신규] 진행 상황
     mean_I, std_I = evaluate_arl1(scen, lam_I, 'I', policy, actions, calib_map, R=args.R, seed=args.seed + 7)
     # 시나리오 II 평가
     mean_II, std_II = evaluate_arl1(scen, lam_II, 'II', policy, actions, calib_map, R=args.R, seed=args.seed + 13)
@@ -448,7 +545,7 @@ def main():
             print(f"{lam:.5f}\t{m:.2f} [{s:.2f}]")
 
     fmt_table(lam_I, mean_I, std_I, f"Scenario I (action_set={action_set})")
-    fmt_table(lam_II, mean_II, std_II, f"Scenario II (action_set={action_set})")
+    fmt_table(lam_II, std_II, std_II, f"Scenario II (action_set={action_set})") # <--- [수정] (오타 수정) mean_II, std_II
 
     # CSV 저장
     out_dir = os.path.abspath('./outputs')
@@ -458,6 +555,11 @@ def main():
     np.savetxt(os.path.join(out_dir, f'arl1_scenII_{"-".join(map(str,action_set))}.csv'),
                np.c_[lam_II, mean_II, std_II], delimiter=',', header='lambda,arl1_mean,arl1_std', comments='')
     print(f"\n[저장 완료] outputs/arl1_scenI_*.csv, outputs/arl1_scenII_*.csv")
+
+    # <--- [신규] 전체 실행 시간 출력
+    end_time = datetime.now()
+    total_duration = end_time - start_time
+    print(f"\n[실행 완료] 총 소요 시간: {total_duration} (시작: {start_time}, 종료: {end_time})")
 
 
 if __name__ == '__main__':
