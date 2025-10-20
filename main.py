@@ -126,23 +126,37 @@ def compute_pS0_stat(
         try:
             import cupy as cp
             from cuml.ensemble import RandomForestClassifier as cuRF
-            from sklearn.model_selection import KFold
+            from sklearn.model_selection import StratifiedKFold   # ← 변경
         except Exception as e:
             raise RuntimeError("cuML이 설치되어 있어야 backend='cuml_cv'를 사용할 수 있습니다. conda로 RAPIDS를 설치하세요.") from e
+
         X_np = X.astype(np.float32)
         y_np = y.astype(np.int32)
-        kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
+
+        # --- 핵심 가드: 소수 클래스 개수에 맞춰 n_splits를 안전하게 줄임
+        class_counts = np.bincount(y_np, minlength=2)
+        min_class = int(class_counts.min())  # 소수 클래스 개수
+        # StratifiedKFold는 각 클래스 샘플수가 n_splits 이상이어야 함
+        n_splits = max(2, min(kfold, min_class))  # 예: window=5면 최대 5-fold
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
         p0_vals = []
-        for tr_idx, te_idx in kf.split(X_np):
-            X_tr = cp.asarray(X_np[tr_idx]); y_tr = cp.asarray(y_np[tr_idx])
+        for tr_idx, te_idx in skf.split(X_np, y_np):
+            # 학습 세트가 단일 클래스인지 체크 (희귀 케이스지만 방어)
+            y_tr_np = y_np[tr_idx]
+            if np.unique(y_tr_np).size < 2:
+                continue  # 이 폴드는 스킵
+
+            X_tr = cp.asarray(X_np[tr_idx]); y_tr = cp.asarray(y_tr_np)
             model = cuRF(
                 n_estimators=n_estimators,
                 max_features=sqrt_int(d),
                 bootstrap=True,
-                n_streams=8,
+                n_streams=1,          # 재현성을 위해 경고가 안내한 설정(선택)
                 random_state=seed,
             )
             model.fit(X_tr, y_tr)
+
             te_S0_mask = np.isin(te_idx, idx_S0)
             te_S0_idx = te_idx[te_S0_mask]
             if len(te_S0_idx) == 0:
@@ -151,20 +165,21 @@ def compute_pS0_stat(
             proba = model.predict_proba(X_te)
             p0 = cp.asnumpy(proba)[:, 0]
             p0_vals.append(p0)
+
+        # 모든 폴드가 스킵되었거나 S0가 테스트에 하나도 안 걸렸다면, 풀데이터로 백업 추정
         if not p0_vals:
             X_S0 = cp.asarray(X_np[idx_S0])
             model = cuRF(
                 n_estimators=n_estimators,
                 max_features=sqrt_int(d),
                 bootstrap=True,
-                n_streams=8,
+                n_streams=1,
                 random_state=seed,
             )
             model.fit(cp.asarray(X_np), cp.asarray(y_np))
             proba = model.predict_proba(X_S0)
             return float(np.mean(cp.asnumpy(proba)[:, 0]))
-        p0_all = np.concatenate(p0_vals)
-        return float(np.mean(p0_all))
+        return float(np.mean(np.concatenate(p0_vals)))
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
