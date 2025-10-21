@@ -1,16 +1,16 @@
 """
 Reinforcement Learning-Based Real-Time Contrasts Control Chart Using an Adaptive Window Size
-논문 실험 재현 — v4 (정적 ETA + GPU 옵션 + tqdm)
+논문 실험 재현 — v5 (CV 가드/공정 백업 + t<w 판정 스킵 + 정적 ETA + tqdm + GPU 옵션)
 
 - 데이터 생성 (시나리오 I/II, d=10)
 - RTC 모니터링 통계 p(S0, t) 계산 (RandomForest)
   * CPU 정확 재현: scikit-learn RF + OOB
-  * GPU 가속 근사: RAPIDS cuML RF + K-fold 교차검증으로 OOB 근사
+  * GPU 가속 근사: RAPIDS cuML RF + StratifiedKFold(OOB 근사) — 단, 소수클래스<2면 sklearn OOB로 공정 백업
 - ARL0=200을 만족하도록 CL(제어한계) 부트스트랩으로 산출
 - Policy Gradient + CNN 정책 네트워크(논문 Table 1 구성)로 윈도우 선택
 - ARL1 평가 (시나리오 I/II)
-- (1) 시작 시 벤치마크를 통해 "전체 파이프라인 예상 완료 시각"을 1회 추정
-- (2) tqdm을 통한 "단계별" 진행률/ETA 표시
+- (1) 시작 시 벤치마크로 "전체 파이프라인 예상 완료 시각" 1회 추정
+- (2) tqdm으로 단계별 진행률/ETA 표시
 
 필요 패키지:
   pip install numpy scikit-learn torch tqdm
@@ -23,7 +23,7 @@ import math
 import os
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _replace
 from datetime import datetime, timedelta
 from typing import Tuple, List, Dict, Optional
 
@@ -37,12 +37,12 @@ import torch.optim as optim
 from tqdm import tqdm
 import warnings
 
-warnings.filterwarnings(
-    "ignore",
-    message="The least populated class in y has only .* members,.*less than n_splits=",
-    category=UserWarning,
-    module="sklearn.model_selection._split",
-)
+# ----------------------------- 경고 필터 -----------------------------
+# (메시지 패턴 대신 모듈+카테고리로 확실히 억제)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.model_selection._split")
+# 필요시 추가
+# warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.validation")
+
 # ----------------------------- 유틸리티 -----------------------------
 
 def set_seed(seed: int = 1234):
@@ -74,36 +74,31 @@ def gen_reference_data(cfg: ScenarioConfig, rng: np.random.RandomState) -> NDArr
     return rng.multivariate_normal(mean=np.zeros(cfg.d), cov=make_cov(cfg.d), size=cfg.N0)
 
 
-def apply_mean_shift(X: NDArray, delta: NDArray, t0: int) -> NDArray:
-    Y = X.copy()
-    if t0 < len(Y):
-        Y[t0:] += delta
-    return Y
-
-
-def make_phase2_series(cfg: ScenarioConfig, rng: np.random.RandomState,
-                       scenario: str, lam: float) -> Tuple[NDArray, NDArray]:
+def make_phase2_series(cfg: ScenarioConfig, rng: np.random.RandomState, scenario: str, lam: float) -> Tuple[NDArray, NDArray]:
     """Returns X (T x d), labels_ic (T,) where labels_ic[t]=1 if in-control else 0."""
     X = rng.multivariate_normal(np.zeros(cfg.d), make_cov(cfg.d), size=cfg.T)
     labels_ic = np.ones(cfg.T, dtype=np.int64)
+
     if scenario.upper() == 'I':
-        delta = np.zeros(cfg.d)
+        # Scenario I: exactly ONE variable is shifted by lam
+        delta = np.zeros(cfg.d, dtype=float)
         delta[0] = lam
     else:
+        # Scenario II: k = round(lam^2) variables are shifted
         k = max(1, int(round(lam**2)))
         k = min(k, cfg.d)
-        a = lam / math.sqrt(k)
-        delta = np.zeros(cfg.d)
+        a = lam / math.sqrt(k)     # keep total shift magnitude consistent
+        delta = np.zeros(cfg.d, dtype=float)
         delta[:k] = a
-    X = apply_mean_shift(X, delta, cfg.shift_time)
-    labels_ic[cfg.shift_time:] = 0
-    return X, labels_ic
 
+    # apply mean shift at t >= shift_time
+    if cfg.shift_time < cfg.T:
+        X[cfg.shift_time:] += delta
+        labels_ic[cfg.shift_time:] = 0
 
-# ---------------------- RTC (RandomForest + OOB / GPU 옵션) ----------------------
-# backend 옵션:
-#  - 'sklearn': scikit-learn RandomForest + OOB (정확 재현, CPU)
-#  - 'cuml_cv': RAPIDS cuML RandomForest, K-fold 교차검증으로 OOB 근사 (GPU)
+    return X.astype(np.float32), labels_ic
+
+# -------------------------- p(S0,t) 계산 ----------------------------
 
 def compute_pS0_stat(
     X: NDArray,
@@ -127,15 +122,14 @@ def compute_pS0_stat(
         rf.fit(X, y)
         oob = getattr(rf, 'oob_decision_function_', None)
         if oob is None:
-            # oob_score=False로 설정되었거나 샘플이 너무 적어 oob가 없는 경우 fallback
+            # 샘플이 너무 적어 oob가 없으면 안전 fallback
             X_S0_np = X[idx_S0]
             if X_S0_np.ndim == 1:
                 X_S0_np = X_S0_np.reshape(1, -1)
             proba = rf.predict_proba(X_S0_np)
             return float(np.mean(proba[:, 0]))
-        
         p0 = oob[idx_S0, 0]
-        return float(np.nanmean(p0)) # S0 샘플이 OOB에 한 번도 안 잡히면 nan이 뜰 수 있음
+        return float(np.nanmean(p0))
 
     elif backend == 'cuml_cv':
         try:
@@ -148,15 +142,13 @@ def compute_pS0_stat(
         X_np = X.astype(np.float32)
         y_np = y.astype(np.int32)
 
-        # --- 핵심 가드: 소수 클래스 개수에 맞춰 n_splits를 안전하게 줄임
+        # --- 핵심 가드: 소수 클래스 개수에 맞춰 n_splits를 안전하게 조정 ---
         class_counts = np.bincount(y_np, minlength=2)
         min_class = int(class_counts.min())
 
-        # --- Case A: 소수 클래스가 2 미만 → CV 불가 → 공정한 백업으로 sklearn OOB 사용 ---
+        # --- Case A: 소수 클래스<2 → CV 불가 → 공정한 백업(sklearn OOB) ---
         if min_class < 2:
-            # sklearn OOB로 편향을 낮춰서 pS0 추정
             from sklearn.ensemble import RandomForestClassifier as skRF
-
             sk = skRF(
                 n_estimators=n_estimators,
                 max_features=max(1, int(np.sqrt(X_np.shape[1]))),
@@ -166,22 +158,18 @@ def compute_pS0_stat(
                 n_jobs=-1,
             )
             sk.fit(X_np, y_np)
-
-            # OOB 확률이 있으면 그걸 사용 (없으면 predict_proba fallback)
-            if getattr(sk, "oob_decision_function_", None) is not None:
-                oob = sk.oob_decision_function_  # shape: (N, n_classes)
+            oob = getattr(sk, "oob_decision_function_", None)
+            if oob is not None:
                 p0 = oob[idx_S0, 0]
-                return float(np.nanmean(p0)) # S0 샘플이 OOB에 한 번도 안 잡히면 nan
-            else:
-                # 안전 fallback: S0만 별도 예측 (1D→2D 가드)
-                X_S0_np = X_np[idx_S0]
-                if X_S0_np.ndim == 1:
-                    X_S0_np = X_S0_np.reshape(1, -1)
-                proba = sk.predict_proba(X_S0_np)
-                return float(np.mean(proba[:, 0]))
+                return float(np.nanmean(p0))
+            X_S0_np = X_np[idx_S0]
+            if X_S0_np.ndim == 1:
+                X_S0_np = X_S0_np.reshape(1, -1)
+            proba = sk.predict_proba(X_S0_np)
+            return float(np.mean(proba[:, 0]))
 
-        # --- Case B: CV 가능 → cuML StratifiedKFold로 안정화 ---
-        n_splits = max(2, min(kfold, min_class))  # kfold(기본5)와 min_class 중 작은 값
+        # --- Case B: CV 가능 → StratifiedKFold로 안정화 ---
+        n_splits = max(2, min(kfold, min_class))
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
         p0_vals = []
@@ -189,36 +177,31 @@ def compute_pS0_stat(
             y_tr_np = y_np[tr_idx]
             if np.unique(y_tr_np).size < 2:
                 continue  # 학습세트가 단일클래스면 건너뜀
-
             # 학습(cuML)
             X_tr = cp.asarray(X_np[tr_idx]); y_tr = cp.asarray(y_tr_np)
             model = cuRF(
                 n_estimators=n_estimators,
                 max_features=max(1, int(np.sqrt(X_np.shape[1]))),
                 bootstrap=True,
-                n_streams=1,             # 재현성 향상
+                n_streams=1,  # 재현성 강화
                 random_state=seed,
             )
             model.fit(X_tr, y_tr)
 
-            # 테스트에서 S0 위치만 뽑아 확률 취합
+            # 테스트에서 S0 위치만 확률 취합
             te_S0_mask = np.isin(te_idx, idx_S0)
             te_S0_idx = te_idx[te_S0_mask]
             if te_S0_idx.size == 0:
                 continue
-            
-            # --- 1D→2D 런타임 에러 방지 가드 (필수) ---
             X_te_np = X_np[te_S0_idx]
             if X_te_np.ndim == 1:
                 X_te_np = X_te_np.reshape(1, -1)
             X_te = cp.asarray(X_te_np)
-            # ----------------------------------------
-
             proba = model.predict_proba(X_te)
             p0_vals.append(cp.asnumpy(proba)[:, 0])
 
         if not p0_vals:
-            # 극단 케이스: 모든 폴드 스킵 → Case A와 동일한 sklearn OOB로 백업
+            # 극단 케이스: 모든 폴드 스킵 → sklearn OOB로 백업
             from sklearn.ensemble import RandomForestClassifier as skRF
             sk = skRF(
                 n_estimators=n_estimators,
@@ -232,12 +215,11 @@ def compute_pS0_stat(
             oob = getattr(sk, "oob_decision_function_", None)
             if oob is not None:
                 return float(np.nanmean(oob[idx_S0, 0]))
-            else:
-                X_S0_np = X_np[idx_S0]
-                if X_S0_np.ndim == 1:
-                    X_S0_np = X_S0_np.reshape(1, -1)
-                proba = sk.predict_proba(X_S0_np)
-                return float(np.mean(proba[:, 0]))
+            X_S0_np = X_np[idx_S0]
+            if X_S0_np.ndim == 1:
+                X_S0_np = X_S0_np.reshape(1, -1)
+            proba = sk.predict_proba(X_S0_np)
+            return float(np.mean(proba[:, 0]))
 
         return float(np.mean(np.concatenate(p0_vals)))
 
@@ -264,7 +246,6 @@ def estimate_CL_for_window(
     alpha = 1.0 / 200.0
     stats = []
     N0 = len(S0)
-    # 진행률 바 (부트스트랩 루프)
     pbar = tqdm(range(n_boot), desc=f"  CL Boot (w={window})", leave=False, dynamic_ncols=True)
     for _ in pbar:
         start = 0 if N0 - window <= 0 else rng.randint(0, N0 - window)
@@ -335,6 +316,7 @@ class WindowCalib:
 
 
 def reward_by_algorithm1(action_idx: int, distances: List[float], in_control: bool) -> float:
+    # distances: 큰 것이 IC에서 선호되도록 설계됨
     order = np.argsort(distances)[::-1]
     rank = int(np.where(order == action_idx)[0][0])
     return ({0: 1.0, 1: -1.0, 2: -2.0}[rank] if in_control else {0: -2.0, 1: -1.0, 2: 1.0}[rank])
@@ -367,7 +349,6 @@ def train_rl_policy(
             pass
     actions = list(cfg.action_set)
 
-    # 에피소드 진행률 바
     pbar_ep = tqdm(range(cfg.episodes), desc="[RL] Training", dynamic_ncols=True)
     for ep in pbar_ep:
         lam_choices_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
@@ -377,46 +358,71 @@ def train_rl_policy(
         else:
             scenario = 'II'; lam = float(rng.choice(lam_choices_II))
         X, labels_ic = make_phase2_series(scen, rng, scenario, lam)
-        a_trace: List[int] = [] # 에피소드 행동 로깅
-        logps: List[torch.Tensor] = []            
-        
-        pbar_ep.set_description(f"[RL] Ep {ep+1}/{cfg.episodes} (scen={scenario}, lam={lam:.2f})")
+
         logps: List[torch.Tensor] = []
         rewards: List[float] = []
-        a_trace: List[int] = [] # 에피소드 행동 로깅
-        for t in range(1, scen.T + 1):
-            pbar_ep.set_postfix_str(f"t={t}/{scen.T}")
-            ms_list, D_list = [], []
+        a_trace: List[int] = []
 
+        for t in range(1, scen.T + 1):
+            # --- 유효 행동 마스크(t>=w) ---
+            valid = [t >= w for w in actions]
+            if not any(valid):
+                # 아직 어떤 창도 꽉 차지 못한 시점이면 상태만 갱신
+                Lmax = 15
+                w_for_state = min(max(actions), t)
+                state = make_state_tensor(X[t - w_for_state:t], scen.d, L=Lmax).to(device)
+                with torch.no_grad():
+                    _ = policy(state)
+                continue
+
+            # --- 유효 행동만 통계/거리 계산 ---
+            ms_list: List[float] = []
+            D_list: List[float] = []
+            valid_indices: List[int] = []
             for a_idx_tmp, w in enumerate(actions):
-                if t < w:
-                    continue  # 아직 창이 덜 찬 행동은 이번 t에서 스킵
-                w_eff = min(w, t)
-                Sw = X[t - w_eff:t]
+                if not valid[a_idx_tmp]:
+                    continue
+                Sw = X[t - w:t]
                 Xrf = np.vstack([S0_ref, Sw])
                 yrf = np.hstack([np.zeros(len(S0_ref), dtype=int), np.ones(len(Sw), dtype=int)])
-                pS0 = compute_pS0_stat(...)
+                pS0 = compute_pS0_stat(
+                    Xrf, yrf, np.arange(len(S0_ref)),
+                    d=scen.d, n_estimators=200,
+                    seed=rng.randint(1_000_000), backend=rf_backend
+                )
                 ms_list.append(pS0)
                 calib = calib_map[w]
                 D = (calib.CL - pS0) / max(1e-8, calib.std)
-                D_list.append(float(D))                
-                
+                D_list.append(float(D))
+                valid_indices.append(a_idx_tmp)
+
+            # --- 정책 분포 (유효하지 않은 행동 마스킹) ---
             Lmax = 15
             w_for_state = min(max(actions), t)
             state = make_state_tensor(X[t - w_for_state:t], scen.d, L=Lmax).to(device)
             logits = policy(state)
-            probs = torch.softmax(logits, dim=-1)
+            logits_masked = logits.clone()
+            for idx, ok in enumerate(valid):
+                if not ok:
+                    logits_masked[0, idx] = -1e9
+            probs = torch.softmax(logits_masked, dim=-1)
             m = torch.distributions.Categorical(probs=probs)
             a_idx_tensor = m.sample()
             a_idx = int(a_idx_tensor.item())
 
-            a_trace.append(actions[a_idx]) # 행동 로깅
-            
+            a_trace.append(actions[a_idx])
             logps.append(m.log_prob(a_idx_tensor))
-            ic = bool(labels_ic[t-1] == 1)
-            rewards.append(float(reward_by_algorithm1(a_idx, D_list, in_control=ic)))
-        
-        pbar_ep.set_postfix_str("Updating policy...")
+
+            # --- 보상(유효 행동의 로컬 인덱스 기준) ---
+            if a_idx not in valid_indices:
+                rewards.append(-2.0)  # 방어적 패널티(원칙적으로 발생하지 않음)
+            else:
+                local_idx = valid_indices.index(a_idx)
+                ic = bool(labels_ic[t-1] == 1)
+                rewards.append(float(reward_by_algorithm1(local_idx, D_list, in_control=ic)))
+
+        # --- Policy Gradient 업데이트 ---
+        pbar_ep.set_postfix_str("Updating policy.")
         G = 0.0
         returns = []
         for r in reversed(rewards):
@@ -432,8 +438,8 @@ def train_rl_policy(
         optimizer.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
-        
-        # --- 여기부터: 10 에피소드마다 요약 로그 출력 ---
+
+        # --- 10 에피소드마다 요약 로그 ---
         if every(10, ep):
             avg_r = float(np.mean(rewards)) if len(rewards) else 0.0
             if len(a_trace):
@@ -442,14 +448,9 @@ def train_rl_policy(
             else:
                 pi_hist = {}
             print(f"\n[ep {ep+1}] avg_reward={avg_r:.3f}  pi(w)={pi_hist}")
-        # -----------------------------------------------
-    
-    pbar_ep.set_postfix_str("Done"); pbar_ep.close()
-    
-    # DataParallel 래퍼 해제 (학습이 완료되었으므로)
+
     if isinstance(policy, nn.DataParallel):
         policy = policy.module
-        
     return policy
 
 
@@ -479,10 +480,7 @@ def run_length_until_alarm(
         # 아직 창이 다 안 찼으면 알람 판단을 미룹니다.
         if t < w:
             continue
-        w_eff = w  # 이제 t >= w 이므로 유효 창 길이는 w와 동일
-        Sw = X[t - w:t]        
-        
-        
+        Sw = X[t - w:t]
         Xrf = np.vstack([S0_ref, Sw])
         yrf = np.hstack([np.zeros(len(S0_ref), dtype=int), np.ones(len(Sw), dtype=int)])
         pS0 = compute_pS0_stat(Xrf, yrf, np.arange(len(S0_ref)), d=d, n_estimators=300, seed=42, backend=rf_backend)
@@ -491,8 +489,10 @@ def run_length_until_alarm(
             return t
     return T
 
+
 def every(n, i):  # i: 0-based index
     return (i + 1) % n == 0
+
 
 def evaluate_arl1(
     scen_cfg: ScenarioConfig,
@@ -501,23 +501,23 @@ def evaluate_arl1(
     policy: PolicyCNN,
     actions: List[int],
     calib_map: Dict[int, WindowCalib],
+    S0_ref: NDArray,
     R: int,
     seed: int,
     rf_backend: str = 'sklearn',
 ) -> Tuple[List[float], List[float]]:
-    rng = check_random_state(seed)
     arl_means: List[float] = []
     arl_stds: List[float] = []
-    S0 = gen_reference_data(scen_cfg, rng)
-    from dataclasses import replace as _replace
+    rng = check_random_state(seed)
+    # ARL1: 시프트 즉시 발생을 가정하므로 shift_time=0으로 복사
     scen_cfg_eval = _replace(scen_cfg, shift_time=0)
     for lam in lam_list:
-        print(f"  Evaluating lam^2={lam**2:.2f} (lam={lam:.4f}) (R={R} reps)...")
+        print(f"  Evaluating lam^2={lam**2:.2f} (lam={lam:.4f}) (R={R} reps).")
         RLs = []
         pbar_R = tqdm(range(R), desc="    Reps", leave=False, dynamic_ncols=True)
         for _ in pbar_R:
-            X, labels_ic = make_phase2_series(scen_cfg_eval, rng, scenario, lam)
-            rl = run_length_until_alarm(X, S0, policy, actions, calib_map, scen_cfg.d, rf_backend=rf_backend)
+            X, _ = make_phase2_series(scen_cfg_eval, rng, scenario, lam)
+            rl = run_length_until_alarm(X, S0_ref, policy, actions, calib_map, scen_cfg.d, rf_backend=rf_backend)
             RLs.append(rl)
         arl_means.append(float(np.mean(RLs)))
         arl_stds.append(float(np.std(RLs, ddof=1)))
@@ -537,7 +537,7 @@ def _run_benchmark_rf(
     rng_bench = check_random_state(seed)
     w_bench = 10
     start_idx = rng_bench.randint(0, len(S0_ref) - w_bench)
-    Sw = S0_ref[start_idx : start_idx + w_bench]
+    Sw = S0_ref[start_idx: start_idx + w_bench]
     X = np.vstack([S0_ref, Sw])
     y = np.hstack([np.zeros(len(S0_ref), dtype=int), np.ones(len(Sw), dtype=int)])
     t0 = time.perf_counter()
@@ -551,7 +551,7 @@ def main():
     start_time = datetime.now()
 
     # ---------- 인자 파싱 ----------
-    parser = argparse.ArgumentParser(description="RL-RTC 논문 재현 스크립트 (v4: 정적 ETA + tqdm + GPU)")
+    parser = argparse.ArgumentParser(description="RL-RTC 논문 재현 스크립트 (v5: CV 가드/공정 백업 + t<w 판정 스킵)")
     parser.add_argument('--seed', type=int, default=2025)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help="PyTorch CNN 연산 장치 ('cuda' 또는 'cpu')")
     parser.add_argument('--episodes', type=int, default=30, help='RL 학습 에피소드 수 (권장 100~300 이상)')
@@ -570,7 +570,7 @@ def main():
 
     # ---------- 설정 출력 ----------
     print("="*60)
-    print("RL-RTC 논문 재현 시뮬레이션 시작 (v4)")
+    print("RL-RTC 논문 재현 시뮬레이션 시작 (v5)")
     print("="*60)
     print(f"Device (CNN): {device}")
     print(f"RF Backend:   {args.rf_backend}")
@@ -584,7 +584,7 @@ def main():
     # -----------------------------------------------------------------
     # 정적 ETA 추정 (서로 다른 단위 작업의 비용 차이를 반영)
     # -----------------------------------------------------------------
-    print("[ETA] 전체 파이프라인 예상 소요 시간 벤치마크 수행 중...")
+    print("[ETA] 전체 파이프라인 예상 소요 시간 벤치마크 수행 중.")
 
     rng_s0 = check_random_state(args.seed)
     S0_ref_bench = gen_reference_data(scen, rng_s0)
@@ -596,7 +596,7 @@ def main():
         bench_times_300.append(_run_benchmark_rf(S0_ref_bench, scen.d, n_estimators=300, seed=args.seed + i, backend=args.rf_backend))
     avg_rf_300_time = float(np.mean(bench_times_300))
     # n=200 RF는 n=300 RF 시간의 (200/300) 근사
-    avg_rf_200_time = avg_rf_300_time * (200.0 / 300.0) 
+    avg_rf_200_time = avg_rf_300_time * (200.0 / 300.0)
 
     lam_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
     lam_II = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
@@ -633,7 +633,7 @@ def main():
     S0_ref = S0_ref_bench
 
     # -------------------- CL 보정 --------------------
-    print(f"[작업 1/3] CL(ARL0=200) 보정 시작 (n_boot={args.n_boot})...")
+    print(f"[작업 1/3] CL(ARL0=200) 보정 시작 (n_boot={args.n_boot}).")
     calib_map: Dict[int, WindowCalib] = {}
     for w in actions:
         calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng_s0.randint(1_000_000), backend=args.rf_backend)
@@ -643,7 +643,7 @@ def main():
 
     # -------------------- RL 학습 --------------------
     print(f"[작업 2/3] RL 정책 학습 시작 (Episodes={args.episodes})...")
-    policy = PolicyCNN(d=scen.d, num_actions=3)
+    policy = PolicyCNN(d=scen.d, num_actions=len(actions))
     optimizer = optim.Adam(policy.parameters(), lr=1e-3)
     rl_cfg = RLConfig(action_set=tuple(actions), device=device, episodes=args.episodes)
     policy = train_rl_policy(policy, optimizer, rl_cfg, scen, calib_map, S0_ref, seed=args.seed, rf_backend=args.rf_backend)
@@ -651,29 +651,27 @@ def main():
 
     # -------------------- ARL1 평가 --------------------
     print(f"[작업 3/3 - A] Scenario I ARL1 평가 시작 (R={args.R})...")
-    mean_I, std_I = evaluate_arl1(scen, lam_I, 'I', policy, actions, calib_map, R=args.R, seed=args.seed + 7, rf_backend=args.rf_backend)
+    mean_I, std_I = evaluate_arl1(scen, lam_I, 'I', policy, actions, calib_map, S0_ref, R=args.R, seed=args.seed + 7, rf_backend=args.rf_backend)
     print("[작업 3/3 - A] Scenario I 완료.")
 
     print(f"[작업 3/3 - B] Scenario II ARL1 평가 시작 (R={args.R})...")
-    mean_II, std_II = evaluate_arl1(scen, lam_II, 'II', policy, actions, calib_map, R=args.R, seed=args.seed + 13, rf_backend=args.rf_backend)
+    mean_II, std_II = evaluate_arl1(scen, lam_II, 'II', policy, actions, calib_map, S0_ref, R=args.R, seed=args.seed + 13, rf_backend=args.rf_backend)
     print("[작업 3/3 - B] Scenario II 완료.")
 
     # -------------------- 결과 출력/저장 --------------------
     def fmt_table(lams, means, stds, title):
         print("" + title)
-        print("lambda^2	lambda		ARL1 (mean [std])")
+        print("lambda^2\tlambda\t\tARL1 (mean [std])")
         for lam, m, s in zip(lams, means, stds):
-            print(f"{lam**2:<8.2f}	{lam:<10.4f}	{m:.2f} [{s:.2f}]")
+            print(f"{lam**2:<8.2f}\t{lam:<10.4f}\t{m:.2f} [{s:.2f}]")
 
     fmt_table(lam_I, mean_I, std_I, f"Scenario I (action_set={actions})")
     fmt_table(lam_II, mean_II, std_II, f"Scenario II (action_set={actions})")
 
     out_dir = os.path.abspath('./outputs')
     os.makedirs(out_dir, exist_ok=True)
-    # 타임스탬프를 파일명에 추가하여 겹치지 않게 저장
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    action_str = "-".join(map(str,actions))
-    
+    action_str = "-".join(map(str, actions))
     np.savetxt(os.path.join(out_dir, f'arl1_scenI_{action_str}_{ts}.csv'), np.c_[lam_I, mean_I, std_I], delimiter=',', header='lambda,arl1_mean,arl1_std', comments='')
     np.savetxt(os.path.join(out_dir, f'arl1_scenII_{action_str}_{ts}.csv'), np.c_[lam_II, mean_II, std_II], delimiter=',', header='lambda,arl1_mean,arl1_std', comments='')
     print(f"[저장 완료] outputs/arl1_scenI_*.csv, outputs/arl1_scenII_*.csv")
