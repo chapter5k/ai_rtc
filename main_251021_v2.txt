@@ -36,7 +36,6 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 import warnings
-import gc
 
 # ----------------------------- 경고 필터 -----------------------------
 # (메시지 패턴 대신 모듈+카테고리로 확실히 억제)
@@ -678,15 +677,6 @@ def main():
     print(f"[저장 완료] outputs/arl1_scenI_*.csv, outputs/arl1_scenII_*.csv")
 
     end_time = datetime.now()
-    # ------- quiet cleanup for cuML (optional) -------
-    try:
-        import cupy as cp
-        cp.get_default_memory_pool().free_all_blocks()
-        cp.get_default_pinned_memory_pool().free_all_blocks()
-    except Exception:
-        pass
-    gc.collect()
-    
     print("" + "="*60)
     print(f"시뮬레이션 종료. 총 소요 시간: {end_time - start_time}")
     print(f"종료 시각: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
