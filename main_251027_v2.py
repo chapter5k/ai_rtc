@@ -37,6 +37,7 @@ import torch.optim as optim
 from tqdm import tqdm
 import warnings
 import gc
+import torch
 
 # ----------------------------- 경고 필터 -----------------------------
 # (메시지 패턴 대신 모듈+카테고리로 확실히 억제)
