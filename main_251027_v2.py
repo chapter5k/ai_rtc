@@ -56,6 +56,18 @@ def set_seed(seed: int = 1234):
 def sqrt_int(x: float) -> int:
     return max(1, int(round(math.sqrt(x))))
 
+def save_policy(policy: nn.Module, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    state = policy.module.state_dict() if isinstance(policy, nn.DataParallel) else policy.state_dict()
+    torch.save(state, path)
+
+def load_policy(path: str, d: int, num_actions: int, device: str) -> nn.Module:
+    policy = PolicyCNN(d=d, num_actions=num_actions)
+    state = torch.load(path, map_location=device)
+    policy.load_state_dict(state)
+    policy.to(device)
+    policy.eval()
+    return policy
 
 # ------------------------- 데이터 생성부 -----------------------------
 @dataclass
@@ -585,6 +597,8 @@ def main():
     parser.add_argument('--rf_backend', type=str, default='sklearn', choices=['sklearn','cuml_cv'], help="RF 백엔드: 'sklearn'(CPU,OOB), 'cuml_cv'(GPU,K-fold OOB 근사)")
     parser.add_argument('--guess_arl1', type=int, default=15, help='ARL1 평균 추정치(정적 ETA 계산용)')
     parser.add_argument('--n_estimators_eval', type=int, default=150, help='평가(ARL1) 단계에서 사용할 RF 트리 수 (기존 300 → 축소)')
+    parser.add_argument('--policy_in', type=str, default=None, help='불러올 정책 가중치(.pt). 지정 시 해당 가중치로 시작')
+    parser.add_argument('--policy_out', type=str, default=None, help='학습 후 저장할 정책 경로(.pt). 미지정 시 자동 결정')    
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -592,6 +606,14 @@ def main():
     action_set = tuple(int(x) for x in args.action_set.split(','))
     actions = list(action_set)
     scen = ScenarioConfig()
+
+    # outputs 디렉토리/정책 경로 준비
+    outputs_dir = os.path.abspath('./outputs')
+    os.makedirs(outputs_dir, exist_ok=True)
+    action_str = "-".join(map(str, actions))
+    if args.policy_out is None:
+        # 에피소드/액션셋 기준 고정 이름 (원하면 timestamp로 변경 가능)
+        args.policy_out = os.path.join(outputs_dir, f'policy_{action_str}.pt')
 
     # ---------- 설정 출력 ----------
     print("="*60)
@@ -670,11 +692,35 @@ def main():
     print("[작업 1/3] CL 보정 완료.")
 
     # -------------------- RL 학습 --------------------
-    print(f"[작업 2/3] RL 정책 학습 시작 (Episodes={args.episodes})...")
+
     policy = PolicyCNN(d=scen.d, num_actions=len(actions))
-    optimizer = optim.Adam(policy.parameters(), lr=1e-3)
-    rl_cfg = RLConfig(action_set=tuple(actions), device=device, episodes=args.episodes)
-    policy = train_rl_policy(policy, optimizer, rl_cfg, scen, calib_map, S0_ref, seed=args.seed, rf_backend=args.rf_backend)
+    # 사전 가중치 로드 (있으면)
+    if args.policy_in and os.path.isfile(args.policy_in):
+        print(f"[작업 2/3] 기존 정책 로드: {args.policy_in}")
+        state = torch.load(args.policy_in, map_location=device)
+        policy.load_state_dict(state)
+        policy.to(device)
+        policy.eval()
+    else:
+        if args.policy_in:
+            print(f"[작업 2/3] 경고: --policy_in 경로가 존재하지 않습니다: {args.policy_in}")
+
+    # 학습 수행 여부
+    if args.episodes > 0:
+        print(f"[작업 2/3] RL 정책 학습 시작 (Episodes={args.episodes})...")
+        optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+        rl_cfg = RLConfig(action_set=tuple(actions), device=device, episodes=args.episodes)
+        policy = train_rl_policy(policy, optimizer, rl_cfg, scen, calib_map, S0_ref, seed=args.seed, rf_backend=args.rf_backend, n_estimators_eval=args.n_estimators_eval)
+        print("[작업 2/3] RL 정책 학습 완료.")
+        # 학습 후 저장
+        try:
+            save_policy(policy, args.policy_out)
+            print(f"[작업 2/3] 정책 저장 완료: {args.policy_out}")
+        except Exception as e:
+            print(f"[작업 2/3] 정책 저장 실패: {e}")
+    else:
+        print("[작업 2/3] RL 학습 스킵 (episodes=0). 기존/초기화된 정책으로 평가 진행.")    
+    
     print("[작업 2/3] RL 정책 학습 완료.")
 
     # -------------------- ARL1 평가 --------------------
