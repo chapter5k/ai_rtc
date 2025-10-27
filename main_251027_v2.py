@@ -585,6 +585,7 @@ def _run_benchmark_rf(
 # ------------------------------- 메인 -------------------------------
 
 def main():
+    import torch
     start_time = datetime.now()
 
     # ---------- 인자 파싱 ----------
