@@ -692,6 +692,13 @@ def main():
         calib_map[w] = WindowCalib(CL=calib.CL, std=calib.std_boot, size=w)
         print(f"  [CL] window={w:2d} -> CL={calib.CL:.5f}, std={calib.std_boot:.5f}")
     print("[작업 1/3] CL 보정 완료.")
+    
+    import numpy as np, pickle, os
+
+    np.save(os.path.join(outputs_dir, "S0_ref.npy"), S0_ref)
+    with open(os.path.join(outputs_dir, "calib_map.pkl"), "wb") as f:
+        pickle.dump(calib_map, f)
+    print("[저장 완료] S0_ref.npy, calib_map.pkl")
 
     # -------------------- RL 학습 --------------------
 
