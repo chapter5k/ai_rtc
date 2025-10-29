@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 from typing import Tuple, List, Dict, Optional
 
 import numpy as np
+import pickle
 from numpy.typing import NDArray
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils import check_random_state
@@ -693,8 +694,6 @@ def main():
         print(f"  [CL] window={w:2d} -> CL={calib.CL:.5f}, std={calib.std_boot:.5f}")
     print("[작업 1/3] CL 보정 완료.")
     
-    import numpy as np, pickle, os
-
     np.save(os.path.join(outputs_dir, "S0_ref.npy"), S0_ref)
     with open(os.path.join(outputs_dir, "calib_map.pkl"), "wb") as f:
         pickle.dump(calib_map, f)
