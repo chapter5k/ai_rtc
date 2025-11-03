@@ -218,8 +218,9 @@ def compute_pS0_stat(
             n_jobs=-1,
             verbose=-1,
             scale_pos_weight=max(1.0, scale_pos_weight),
-            device_type="gpu" if use_gpu else "cpu",   # ✅ GPU 활성화
         )
+        
+        lgbm_params["device_type"] = "gpu" if use_gpu else "cpu"
 
         p0_vals = []
         for tr_idx, te_idx in skf.split(X_np, y_np):
@@ -227,7 +228,7 @@ def compute_pS0_stat(
             if np.unique(y_tr_np).size < 2:
                 continue  # 학습세트가 단일클래스면 건너뜀
 
-            model = LGBMClassifier(**lgbm_params, device_type="gpu" if use_gpu else "cpu",)
+            model = LGBMClassifier(**lgbm_params)
             model.fit(X_np[tr_idx], y_tr_np)  # ✅ fit: ndarray
 
             # 테스트 폴드 중 S0 위치만 확률 취합
@@ -723,16 +724,15 @@ def _run_benchmark_rf(
         )
 
     elif backend == "lgbm":
-        # ✅ LGBM 경로: fit/predict 모두 넘파이로 통일 (feature names 경고 방지)
+        # ✅ LGBM 경로: fit/predict 모두 넘파이로 통일 + GPU/CPU 자동 선택
         from lightgbm import LGBMClassifier
-
+        # 1) feature names 경고 방지: 항상 ndarray 사용
         X_np = np.asarray(X, dtype=np.float32)
         y_np = np.asarray(y, dtype=np.int32)
         X_np = np.ascontiguousarray(X_np)
         y_np = np.ascontiguousarray(y_np)
-        
+        # 2) 장치 선택 (main()에서 os.environ["AI_RTC_DEVICE"]=args.device 설정 필요)
         use_gpu = os.environ.get("AI_RTC_DEVICE", "cpu").lower() == "cuda"
-
         model = LGBMClassifier(
             objective="binary",
             n_estimators=n_estimators,
@@ -743,8 +743,7 @@ def _run_benchmark_rf(
             reg_lambda=1.0,
             verbose=-1,
             n_jobs=-1,
-            device_type="gpu" if use_gpu else "cpu",
-            # scale_pos_weight 등은 벤치마크 목적상 생략 (속도만 잼)
+            device_type=("gpu" if use_gpu else "cpu"),
         )
         model.fit(X_np, y_np)
         _ = model.predict_proba(X_np)  # 예측까지 포함해 ETA가 실제에 가깝게
@@ -821,7 +820,7 @@ def main():
 
     N_BENCH_RUNS = 20
     bench_times_300 = []
-    pbar_bench = tqdm(range(N_BENCH_RUNS), desc="  Bench RF(n=300)", leave=False, dynamic_ncols=True)
+    pbar_bench = tqdm(range(N_BENCH_RUNS), desc="  Bench Clf(n=300)", leave=False, dynamic_ncols=True)
     for i in pbar_bench:
         bench_times_300.append(_run_benchmark_rf(S0_ref_bench, scen.d, n_estimators=300, seed=args.seed + i, backend=args.rf_backend))
     avg_rf_300_time = float(np.mean(bench_times_300))
