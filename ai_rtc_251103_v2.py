@@ -155,7 +155,7 @@ def compute_pS0_stat(
         except Exception as e:
             raise RuntimeError("LightGBM이 설치되어 있어야 backend='lgbm'를 사용할 수 있습니다. pip install lightgbm") from e
         
-        use_gpu = os.environ.get("AI_RTC_DEVICE", "cpu").lower() == "cuda"
+        use_gpu = (str(device).lower()=="cuda")
 
         # ✅ 1) 무조건 넘파이로 캐스팅 (DataFrame → ndarray)
         #    astype(...)는 DF를 여전히 DF로 유지하므로 경고 원인이 됨
@@ -731,7 +731,7 @@ def _run_benchmark_rf(
         X_np = np.ascontiguousarray(X_np)
         y_np = np.ascontiguousarray(y_np)
         
-        use_gpu = os.environ.get("AI_RTC_DEVICE", "cpu").lower() == "cuda"
+        use_gpu = (str(device).lower() == "cuda")
 
         model = LGBMClassifier(
             objective="binary",
@@ -770,7 +770,7 @@ def main():
     parser.add_argument('--R', type=int, default=100, help='ARL1 평가 반복 (논문 500)')
     parser.add_argument('--rf_backend', type=str, default='sklearn', 
                         choices=['sklearn','cuml_cv','lgbm'], 
-                        help="RF 백엔드: 'sklearn'(CPU,OOB), 'cuml_cv'(GPU,K-fold OOB 근사), 'lgbm'(CPU/GPU)")
+                        help="RF 백엔드: 'sklearn'(CPU,OOB), 'cuml_cv'(GPU,K-fold OOB 근사)")
     parser.add_argument('--guess_arl1', type=int, default=15, help='ARL1 평균 추정치(정적 ETA 계산용)')
     parser.add_argument('--n_estimators_eval', type=int, default=150, help='평가(ARL1) 단계에서 사용할 RF 트리 수 (기존 300 → 축소)')
     parser.add_argument('--policy_in', type=str, default=None, help='불러올 정책 가중치(.pt). 지정 시 해당 가중치로 시작')
@@ -779,8 +779,6 @@ def main():
 
     set_seed(args.seed)
     device = args.device
-    os.environ["AI_RTC_DEVICE"] = device
-    
     action_set = tuple(int(x) for x in args.action_set.split(','))
     actions = list(action_set)
     scen = ScenarioConfig()
