@@ -42,11 +42,20 @@ import torch
 
 # ----------------------------- 경고 필터 -----------------------------
 # (메시지 패턴 대신 모듈+카테고리로 확실히 억제)
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.model_selection._split")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.validation")
 # 필요시 추가
 # warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.validation")
 
 # ----------------------------- 유틸리티 -----------------------------
+def _np2d(X, dtype=np.float32):
+    A = np.asarray(X, dtype=dtype)
+    if A.ndim == 1:
+        A = A.reshape(1, -1)
+    return np.ascontiguousarray(A)
+
+def _np1d(y, dtype=np.int32):
+    a = np.asarray(y, dtype=dtype).ravel()
+    return np.ascontiguousarray(a)
 
 def set_seed(seed: int = 1234):
     random.seed(seed)
@@ -389,7 +398,6 @@ class CLCalib:
     CL: float
     std_boot: float
 
-
 def estimate_CL_for_window(
     S0: NDArray,
     d: int,
@@ -407,10 +415,27 @@ def estimate_CL_for_window(
     for _ in pbar:
         start = 0 if N0 - window <= 0 else rng.randint(0, N0 - window)
         Sw = S0[start:start + window]
+
+        # 정상(S0) vs 비정상(Sw)
         X = np.vstack([S0, Sw])
-        y = np.hstack([np.zeros(len(S0), dtype=int), np.ones(len(Sw), dtype=int)])
-        pS0 = compute_pS0_stat(X, y, np.arange(len(S0)), d=d, n_estimators=n_estimators, seed=rng.randint(1_000_000), backend=backend)
+        y = np.hstack([
+            np.zeros(len(S0), dtype=int),
+            np.ones(len(Sw), dtype=int),
+        ])
+
+        # ✅ 항상 넘파이로 통일 (DataFrame→ndarray 변환)
+        X = _np2d(X, dtype=np.float32)
+        y = _np1d(y, dtype=np.int32)
+
+        # CL 보정용 통계 계산
+        pS0 = compute_pS0_stat(
+            X, y, np.arange(len(S0)),
+            d=d, n_estimators=n_estimators,
+            seed=rng.randint(1_000_000),
+            backend=backend,
+        )
         stats.append(pS0)
+
     stats = np.asarray(stats)
     CL = np.quantile(stats, 1 - alpha)
     std_boot = float(np.std(stats, ddof=1))
@@ -642,10 +667,14 @@ def run_length_until_alarm(
         Sw = X[t - w:t]
         Xrf = np.vstack([S0_ref, Sw])
         yrf = np.hstack([np.zeros(len(S0_ref), dtype=int), np.ones(len(Sw), dtype=int)])
+        # ✅ 항상 ndarray로 통일(DF→ndarray 혼용 경고 방지)
+        Xrf = _np2d(Xrf, dtype=np.float32)
+        yrf = _np1d(yrf, dtype=np.int32)
         pS0 = compute_pS0_stat(
             Xrf, yrf, np.arange(len(S0_ref)),
             d=d, n_estimators=n_estimators_eval, seed=42, backend=rf_backend
-        )
+        )        
+        
         calib = calib_map[w]
         if pS0 > calib.CL:
             return t
