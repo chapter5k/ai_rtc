@@ -151,12 +151,18 @@ def compute_pS0_stat(
         try:
             import numpy as np
             from sklearn.model_selection import StratifiedKFold
-            import lightgbm as lgb
+            from lightgbm import LGBMClassifier
         except Exception as e:
             raise RuntimeError("LightGBM이 설치되어 있어야 backend='lgbm'를 사용할 수 있습니다. pip install lightgbm") from e
 
-        X_np = X.astype(np.float32)
-        y_np = y.astype(np.int32)
+        # ✅ 1) 무조건 넘파이로 캐스팅 (DataFrame → ndarray)
+        #    astype(...)는 DF를 여전히 DF로 유지하므로 경고 원인이 됨
+        X_np = np.asarray(X, dtype=np.float32)
+        y_np = np.asarray(y, dtype=np.int32)
+
+        # (선택) 메모리 연속성 확보 – 일부 환경에서 약간의 이득
+        X_np = np.ascontiguousarray(X_np)
+        y_np = np.ascontiguousarray(y_np)
 
         # --- 핵심 가드: 소수 클래스 개수에 맞춰 n_splits를 안전하게 조정 ---
         class_counts = np.bincount(y_np, minlength=2)
@@ -184,9 +190,8 @@ def compute_pS0_stat(
             return float(np.mean(proba[:, 0]))
 
         # --- Case B: CV 가능 → StratifiedKFold로 안정화 ---
-        # 주: 외부 설정에 kfold 변수가 있다면 동일하게 사용
         try:
-            n_splits = max(2, min(kfold, min_class))  # 코드베이스에 kfold가 있으면 사용
+            n_splits = max(2, min(kfold, min_class))  # 외부 kfold 설정이 있으면 사용
         except NameError:
             n_splits = max(3, min(5, min_class))      # 백업 디폴트(3~5)
 
@@ -197,7 +202,7 @@ def compute_pS0_stat(
         n_neg = int((y_np == 0).sum())
         scale_pos_weight = float(n_neg) / float(max(1, n_pos))
 
-        # LGBMClassifier 파라미터(안정 프리셋)
+        # ✅ 2) scikit API 사용 (fit/predict 모두 ndarray로 통일)
         lgbm_params = dict(
             objective="binary",
             boosting_type="gbdt",
@@ -210,7 +215,7 @@ def compute_pS0_stat(
             random_state=seed,
             n_jobs=-1,
             verbose=-1,
-            scale_pos_weight=max(1.0, scale_pos_weight),  # 과도 가중 방지
+            scale_pos_weight=max(1.0, scale_pos_weight),
         )
 
         p0_vals = []
@@ -219,22 +224,20 @@ def compute_pS0_stat(
             if np.unique(y_tr_np).size < 2:
                 continue  # 학습세트가 단일클래스면 건너뜀
 
-            # 학습(LightGBM, scikit API)
-            model = lgb.LGBMClassifier(**lgbm_params)
-            model.fit(X_np[tr_idx], y_tr_np)
+            model = LGBMClassifier(**lgbm_params)
+            model.fit(X_np[tr_idx], y_tr_np)  # ✅ fit: ndarray
 
             # 테스트 폴드 중 S0 위치만 확률 취합
-            te_S0_mask = np.isin(te_idx, idx_S0)
-            te_S0_idx = te_idx[te_S0_mask]
+            te_S0_idx = te_idx[np.isin(te_idx, idx_S0)]
             if te_S0_idx.size == 0:
                 continue
+
             X_te_np = X_np[te_S0_idx]
             if X_te_np.ndim == 1:
                 X_te_np = X_te_np.reshape(1, -1)
 
-            proba = model.predict_proba(X_te_np)
-            # 이진이므로 class-0 확률이 필요 → p(class0) = proba[:, 0]
-            p0_vals.append(proba[:, 0])
+            proba = model.predict_proba(X_te_np)  # ✅ predict: ndarray
+            p0_vals.append(proba[:, 0])           # class-0 확률이 p(S0,t)
 
             # 메모리 정리(큰 실험에서 유용)
             try:
@@ -264,7 +267,6 @@ def compute_pS0_stat(
             return float(np.mean(proba[:, 0]))
 
         return float(np.mean(np.concatenate(p0_vals)))
-    
 
     elif backend == 'cuml_cv':
         try:
