@@ -719,7 +719,9 @@ def main():
     parser.add_argument('--n_boot', type=int, default=800, help='CL 부트스트랩 반복 (권장 2000~10000)')
     parser.add_argument('--action_set', type=str, default='5,10,15', help='윈도우 크기 옵션 (예: 5,10,15 또는 3,10,17)')
     parser.add_argument('--R', type=int, default=100, help='ARL1 평가 반복 (논문 500)')
-    parser.add_argument('--rf_backend', type=str, default='sklearn', choices=['sklearn','cuml_cv'], help="RF 백엔드: 'sklearn'(CPU,OOB), 'cuml_cv'(GPU,K-fold OOB 근사)")
+    parser.add_argument('--rf_backend', type=str, default='sklearn', 
+                        choices=['sklearn','cuml_cv','lgbm'], 
+                        help="RF 백엔드: 'sklearn'(CPU,OOB), 'cuml_cv'(GPU,K-fold OOB 근사)")
     parser.add_argument('--guess_arl1', type=int, default=15, help='ARL1 평균 추정치(정적 ETA 계산용)')
     parser.add_argument('--n_estimators_eval', type=int, default=150, help='평가(ARL1) 단계에서 사용할 RF 트리 수 (기존 300 → 축소)')
     parser.add_argument('--policy_in', type=str, default=None, help='불러올 정책 가중치(.pt). 지정 시 해당 가중치로 시작')
@@ -760,6 +762,11 @@ def main():
 
     rng_s0 = check_random_state(args.seed)
     S0_ref_bench = gen_reference_data(scen, rng_s0)
+
+    # <<< 여기에 추가 >>>
+    t_unit = _run_benchmark_rf(S0_ref_bench, scen.d, args.n_estimators_eval, args.seed, args.rf_backend)
+    print(f"[ETA] Benchmark ({args.rf_backend}, n_estimators={args.n_estimators_eval}): {t_unit:.3f} sec/call")
+
 
     N_BENCH_RUNS = 20
     bench_times_300 = []
