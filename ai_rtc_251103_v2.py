@@ -568,6 +568,8 @@ def train_rl_policy(
                 Sw = X[t - w:t]
                 Xrf = np.vstack([S0_ref, Sw])
                 yrf = np.hstack([np.zeros(len(S0_ref), dtype=int), np.ones(len(Sw), dtype=int)])
+                Xrf = _np2d(Xrf, dtype=np.float32)
+                yrf = _np1d(yrf, dtype=np.int32)
                 pS0 = compute_pS0_stat(
                     Xrf, yrf, np.arange(len(S0_ref)),
                     d=scen.d, n_estimators=n_estimators_eval,
@@ -902,10 +904,12 @@ def main():
         print(f"  [CL] window={w:2d} -> CL={calib.CL:.5f}, std={calib.std_boot:.5f}")
     print("[작업 1/3] CL 보정 완료.")
     
-    np.save(os.path.join(outputs_dir, "S0_ref.npy"), S0_ref)
-    with open(os.path.join(outputs_dir, "calib_map.pkl"), "wb") as f:
+    backend_tag = args.rf_backend
+    
+    np.save(os.path.join(outputs_dir, f"S0_ref_{backend_tag}.npy"), S0_ref)
+    with open(os.path.join(outputs_dir, f"calib_map_{backend_tag}.pkl"), "wb") as f:
         pickle.dump(calib_map, f)
-    print("[저장 완료] S0_ref.npy, calib_map.pkl")
+    print(f"[저장 완료] S0_ref_{backend_tag}.npy, calib_map_{backend_tag}.pkl")
 
     # -------------------- RL 학습 --------------------
 
@@ -930,7 +934,7 @@ def main():
         print("[작업 2/3] RL 정책 학습 완료.")
         # 학습 후 저장
         try:
-            save_policy(policy, args.policy_out)
+            save_policy(policy, os.path.join(outputs_dir, f"policy_{backend_tag}_{action_str}.pt"))
             print(f"[작업 2/3] 정책 저장 완료: {args.policy_out}")
         except Exception as e:
             print(f"[작업 2/3] 정책 저장 실패: {e}")
