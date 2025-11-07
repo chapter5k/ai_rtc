@@ -844,6 +844,9 @@ def main():
     parser.add_argument('--n_estimators_eval', type=int, default=150, help='평가(ARL1) 단계에서 사용할 RF 트리 수 (기존 300 → 축소)')
     parser.add_argument('--policy_in', type=str, default=None, help='불러올 정책 가중치(.pt). 지정 시 해당 가중치로 시작')
     parser.add_argument('--policy_out', type=str, default=None, help='학습 후 저장할 정책 경로(.pt). 미지정 시 자동 결정')    
+    parser.add_argument('--S0_ref_path', type=str, default="", help="CL 보정 없이 사용할 S0_ref .npy 경로")
+    parser.add_argument('--calib_map_path', type=str, default="", help="CL 보정 없이 사용할 calib_map .pkl 경로")    
+    
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -857,6 +860,21 @@ def main():
     # outputs 디렉토리/정책 경로 준비
     outputs_dir = os.path.abspath('./outputs')
     os.makedirs(outputs_dir, exist_ok=True)
+        
+    # === 이어 실행 입력 경로 결정 (명시 경로 없으면 백엔드 태그 기본값) ===
+    default_S0 = os.path.join(outputs_dir, f"S0_ref_{args.rf_backend}.npy")
+    default_calib = os.path.join(outputs_dir, f"calib_map_{args.rf_backend}.pkl")
+    S0_ref_path = args.S0_ref_path or default_S0
+    calib_map_path = args.calib_map_path or default_calib
+
+    # === CL 단계 스킵 여부 판단 ===
+    want_skip_cl = (args.n_boot == 0)  # 사용자가 n_boot=0이면 명시 스킵 의사
+    can_load_cl = (os.path.exists(S0_ref_path) and os.path.exists(calib_map_path))
+    skip_cl = want_skip_cl and can_load_cl
+    if want_skip_cl and not can_load_cl:
+        print(f"[경고] --n_boot 0 이지만 파일이 없습니다. ({S0_ref_path}, {calib_map_path}) → CL 보정을 수행합니다.")    
+    
+    
     action_str = "-".join(map(str, actions))
     if args.policy_out is None:
         # 에피소드/액션셋 기준 고정 이름 (원하면 timestamp로 변경 가능)
@@ -936,6 +954,26 @@ def main():
 
     # -------------------- CL 보정 --------------------
     print(f"[작업 1/3] CL(ARL0=200) 보정 시작 (n_boot={args.n_boot}).")
+    if skip_cl:
+        # === 저장된 결과를 로드 ===
+        S0_ref = np.load(S0_ref_path)
+        with open(calib_map_path, "rb") as f:
+            calib_map = pickle.load(f)
+        print(f"[로드 완료] {os.path.basename(S0_ref_path)}, {os.path.basename(calib_map_path)} (backend={args.rf_backend})")
+    else:
+        # === 기존 부트스트랩 로직 (그대로 유지) ===
+        calib_map: Dict[int, WindowCalib] = {}
+        for w in actions:
+            calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng_s0.randint(1_000_000), backend=args.rf_backend)
+            calib_map[w] = WindowCalib(CL=calib.CL, std=calib.std_boot, size=w)
+            print(f"  [CL] window={w:2d} -> CL={calib.CL:.5f}, std={calib.std_boot:.5f}")
+        print("[작업 1/3] CL 보정 완료.")
+        backend_tag = args.rf_backend
+        np.save(os.path.join(outputs_dir, f"S0_ref_{backend_tag}.npy"), S0_ref)
+        with open(os.path.join(outputs_dir, f"calib_map_{backend_tag}.pkl"), "wb") as f:
+            pickle.dump(calib_map, f)
+        print(f"[저장 완료] S0_ref_{backend_tag}.npy, calib_map_{backend_tag}.pkl")
+    
     calib_map: Dict[int, WindowCalib] = {}
     for w in actions:
         calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng_s0.randint(1_000_000), backend=args.rf_backend)
