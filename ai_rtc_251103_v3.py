@@ -67,10 +67,19 @@ def set_seed(seed: int = 1234):
 def sqrt_int(x: float) -> int:
     return max(1, int(round(math.sqrt(x))))
 
+def _unwrap_model(m: nn.Module) -> nn.Module:
+    # torch.compile 래핑 해제
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
+    # DataParallel 래핑 해제
+    if isinstance(m, nn.DataParallel):
+        m = m.module
+    return m
+
 def save_policy(policy: nn.Module, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    state = policy.module.state_dict() if isinstance(policy, nn.DataParallel) else policy.state_dict()
-    torch.save(state, path)
+    base = _unwrap_model(policy)
+    torch.save(base.state_dict(), path)
 
 def load_policy(path: str, d: int, num_actions: int, device: str) -> nn.Module:
     policy = PolicyCNN(d=d, num_actions=num_actions)
@@ -851,6 +860,7 @@ def main():
     parser.add_argument('--calib_map_path', type=str, default="", help="CL 보정 없이 사용할 calib_map .pkl 경로")    
     
     args = parser.parse_args()
+    backend_tag = args.rf_backend  # 인자 파싱 직후
 
     set_seed(args.seed)
     device = args.device
@@ -994,8 +1004,27 @@ def main():
     # 사전 가중치 로드 (있으면)
     if args.policy_in and os.path.isfile(args.policy_in):
         print(f"[작업 2/3] 기존 정책 로드: {args.policy_in}")
-        state = torch.load(args.policy_in, map_location=device)
-        policy.load_state_dict(state)
+        raw_state = torch.load(args.policy_in, map_location=device)
+
+        from collections import OrderedDict
+        state = OrderedDict()
+        for k, v in raw_state.items():
+            k2 = k
+            # torch.compile + DataParallel 프리픽스 제거
+            if k2.startswith("_orig_mod.module."):
+                k2 = k2[len("_orig_mod.module."):]
+            elif k2.startswith("_orig_mod."):
+                k2 = k2[len("_orig_mod."):]
+            if k2.startswith("module."):
+                k2 = k2[len("module."):]
+            state[k2] = v
+
+        missing, unexpected = policy.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[경고] state_dict 누락 키: {missing}")
+        if unexpected:
+            print(f"[경고] state_dict 예상치 못한 키: {unexpected}")
+
         policy.to(device)
         policy.eval()
     else:
