@@ -959,12 +959,22 @@ def main():
         S0_ref = np.load(S0_ref_path)
         with open(calib_map_path, "rb") as f:
             calib_map = pickle.load(f)
+        # 윈도우 누락 검사 (액션 셋과 일치하는지)
+        missing = [w for w in actions if w not in calib_map]
+        if missing:
+            raise ValueError(f"calib_map에 누락된 window가 있습니다: {missing}. "
+                            f"액션셋={actions}, 파일={os.path.basename(calib_map_path)}")
         print(f"[로드 완료] {os.path.basename(S0_ref_path)}, {os.path.basename(calib_map_path)} (backend={args.rf_backend})")
+        print("[작업 1/3] CL 보정 스킵(로드 모드).")
     else:
         # === 기존 부트스트랩 로직 (그대로 유지) ===
         calib_map: Dict[int, WindowCalib] = {}
         for w in actions:
-            calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng_s0.randint(1_000_000), backend=args.rf_backend)
+            calib = estimate_CL_for_window(
+                S0_ref, scen.d, window=w,
+                n_boot=args.n_boot, n_estimators=300,
+                seed=rng_s0.randint(1_000_000), backend=args.rf_backend
+            )
             calib_map[w] = WindowCalib(CL=calib.CL, std=calib.std_boot, size=w)
             print(f"  [CL] window={w:2d} -> CL={calib.CL:.5f}, std={calib.std_boot:.5f}")
         print("[작업 1/3] CL 보정 완료.")
@@ -973,7 +983,7 @@ def main():
         with open(os.path.join(outputs_dir, f"calib_map_{backend_tag}.pkl"), "wb") as f:
             pickle.dump(calib_map, f)
         print(f"[저장 완료] S0_ref_{backend_tag}.npy, calib_map_{backend_tag}.pkl")
-    
+
     calib_map: Dict[int, WindowCalib] = {}
     for w in actions:
         calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng_s0.randint(1_000_000), backend=args.rf_backend)
