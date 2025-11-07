@@ -1,0 +1,22 @@
+python main_251027_v2.py \
+  --device cuda --rf_backend cuml_cv \
+  --episodes 100 --n_boot 2000 --R 500 \
+  --n_estimators_eval 150 \
+  --policy_out outputs/policy_5-10-15.pt
+
+
+
+python ai_rtc_251103_v2.py \
+  --device cuda --rf_backend cuml_cv \
+  --episodes 100 --n_boot 2000 --R 500 \
+  --n_estimators_eval 150 \
+  --policy_out outputs/policy_5-10-15.pt \
+  --seed 2025
+
+
+python ai_rtc_251103_v2.py \
+  --device cuda --rf_backend lgbm \
+  --episodes 100 --n_boot 2000 --R 500 \
+  --n_estimators_eval 150 \
+  --policy_out outputs/policy_lgbm_5-10-15.pt \
+  --seed 2025
