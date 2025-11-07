@@ -407,6 +407,9 @@ def estimate_CL_for_window(
     seed: int,
     backend: str = 'sklearn',
 ) -> CLCalib:
+    if n_boot <= 0:
+        raise ValueError("estimate_CL_for_window: n_boot must be >= 1 (CL 스킵은 main에서 로드 분기를 사용).")
+    
     rng = check_random_state(seed)
     alpha = 1.0 / 200.0
     stats = []
@@ -984,19 +987,6 @@ def main():
             pickle.dump(calib_map, f)
         print(f"[저장 완료] S0_ref_{backend_tag}.npy, calib_map_{backend_tag}.pkl")
 
-    calib_map: Dict[int, WindowCalib] = {}
-    for w in actions:
-        calib = estimate_CL_for_window(S0_ref, scen.d, window=w, n_boot=args.n_boot, n_estimators=300, seed=rng_s0.randint(1_000_000), backend=args.rf_backend)
-        calib_map[w] = WindowCalib(CL=calib.CL, std=calib.std_boot, size=w)
-        print(f"  [CL] window={w:2d} -> CL={calib.CL:.5f}, std={calib.std_boot:.5f}")
-    print("[작업 1/3] CL 보정 완료.")
-    
-    backend_tag = args.rf_backend
-    
-    np.save(os.path.join(outputs_dir, f"S0_ref_{backend_tag}.npy"), S0_ref)
-    with open(os.path.join(outputs_dir, f"calib_map_{backend_tag}.pkl"), "wb") as f:
-        pickle.dump(calib_map, f)
-    print(f"[저장 완료] S0_ref_{backend_tag}.npy, calib_map_{backend_tag}.pkl")
 
     # -------------------- RL 학습 --------------------
 
