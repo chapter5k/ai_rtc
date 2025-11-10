@@ -81,13 +81,14 @@ def save_policy(policy: nn.Module, path: str):
     base = _unwrap_model(policy)
     torch.save(base.state_dict(), path)
 
-def load_policy(path: str, d: int, num_actions: int, device: str) -> nn.Module:
-    policy = PolicyCNN(d=d, num_actions=num_actions)
+def load_policy(path: str, d: int, num_actions: int, device: str, arch: str = 'cnn') -> nn.Module:
+    policy = build_policy(arch, d=d, num_actions=num_actions)
     state = torch.load(path, map_location=device)
     policy.load_state_dict(state)
     policy.to(device)
     policy.eval()
     return policy
+
 
 # ------------------------- 데이터 생성부 -----------------------------
 @dataclass
@@ -501,6 +502,33 @@ def make_state_tensor(windowed: NDArray, d: int, L: int = 15) -> torch.Tensor:
     t = torch.from_numpy(data.astype(np.float32)).unsqueeze(0).unsqueeze(0)
     return t
 
+class PolicyCNNLSTM(nn.Module):
+    """
+    입력 x: (B, 1, L, d)  # make_state_tensor 결과, 기본 L=15, d=10 가정
+    Conv1d(시간축) -> LSTM(128) -> FC(#actions)
+    """
+    def __init__(self, d: int, num_actions: int):
+        super().__init__()
+        if d != 10:
+            raise ValueError("이 모델은 현재 d=10 가정으로 설계되었습니다.")
+        conv_out = 64
+        # (B,1,L,d) -> (B,L,d) -> (B,d,L) 후 Conv1d
+        self.conv1 = nn.Conv1d(in_channels=d, out_channels=conv_out, kernel_size=3, padding=1)
+        self.act1  = nn.ReLU()
+        self.lstm  = nn.LSTM(input_size=conv_out, hidden_size=128, num_layers=1,
+                             batch_first=True, bidirectional=False)
+        self.fc    = nn.Linear(128, num_actions)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.squeeze(1)           # (B, L, d)
+        x = x.permute(0, 2, 1)     # (B, d, L)
+        z = self.act1(self.conv1(x))   # (B, 64, L)
+        z = z.permute(0, 2, 1)     # (B, L, 64)  # LSTM 입력
+        out, (h, c) = self.lstm(z)
+        h_last = h[-1]             # (B, 128)
+        logits = self.fc(h_last)   # (B, #actions)
+        return logits
+
 
 @dataclass
 class WindowCalib:
@@ -519,7 +547,7 @@ def reward_by_algorithm1(action_idx: int, distances: List[float], in_control: bo
 # ----------------------------- 학습 루프 ------------------------------
 
 def train_rl_policy(
-    policy: PolicyCNN,
+    policy: nn.Module,
     optimizer: optim.Optimizer,
     cfg: RLConfig,
     scen: ScenarioConfig,
@@ -528,7 +556,7 @@ def train_rl_policy(
     seed: int,
     rf_backend: str = 'sklearn',
     n_estimators_eval: int = 150,
-) -> PolicyCNN:
+) -> nn.Module:
     rng = check_random_state(seed)
     policy.train()
     device = cfg.device
@@ -848,6 +876,7 @@ def _run_benchmark_rf(
 def main():
     import torch
     start_time = datetime.now()
+    os.environ["AI_RTC_DEVICE"] = args.device
 
     # ---------- 인자 파싱 ----------
     parser = argparse.ArgumentParser(description="RL-RTC 논문 재현 스크립트 (v5: CV 가드/공정 백업 + t<w 판정 스킵)")
@@ -901,8 +930,10 @@ def main():
     
     action_str = "-".join(map(str, actions))
     if args.policy_out is None:
-        # 에피소드/액션셋 기준 고정 이름 (원하면 timestamp로 변경 가능)
-        args.policy_out = os.path.join(outputs_dir, f'policy_{action_str}.pt')
+        backend_tag = args.rf_backend
+        arch_tag = args.policy_arch
+        action_str = args.action_set.replace(',', '-')
+        args.policy_out = os.path.join(outputs_dir, f'policy_{backend_tag}_{arch_tag}_{action_str}.pt')
 
     # ---------- 설정 출력 ----------
     print("="*60)
@@ -1011,8 +1042,11 @@ def main():
 
     # -------------------- RL 학습 --------------------
 
-    policy = PolicyCNN(d=scen.d, num_actions=len(actions))
-    # 사전 가중치 로드 (있으면)
+    # 1) 정책 생성: CNN ↔ CNN-LSTM를 스위치
+    policy = build_policy(args.policy_arch, d=scen.d, num_actions=len(actions))
+    policy.to(device)
+
+    # 2) (그대로 유지) 기존 체크포인트 로드: compile/DataParallel 프리픽스 제거 포함
     if args.policy_in and os.path.isfile(args.policy_in):
         print(f"[작업 2/3] 기존 정책 로드: {args.policy_in}")
         raw_state = torch.load(args.policy_in, map_location=device)
@@ -1029,6 +1063,10 @@ def main():
             if k2.startswith("module."):
                 k2 = k2[len("module."):]
             state[k2] = v
+
+        _base = _unwrap_model(policy)  # 기존 유틸
+        _base.load_state_dict(state, strict=True)
+        policy.to(device)
 
         missing, unexpected = policy.load_state_dict(state, strict=False)
         if missing:
@@ -1051,7 +1089,8 @@ def main():
         print("[작업 2/3] RL 정책 학습 완료.")
         # 학습 후 저장
         try:
-            save_policy(policy, os.path.join(outputs_dir, f"policy_{backend_tag}_{action_str}.pt"))
+            arch_tag = args.policy_arch
+            save_policy(policy, args.policy_out)
             print(f"[작업 2/3] 정책 저장 완료: {args.policy_out}")
         except Exception as e:
             print(f"[작업 2/3] 정책 저장 실패: {e}")
