@@ -876,7 +876,6 @@ def _run_benchmark_rf(
 def main():
     import torch
     start_time = datetime.now()
-    os.environ["AI_RTC_DEVICE"] = args.device
 
     # ---------- 인자 파싱 ----------
     parser = argparse.ArgumentParser(description="RL-RTC 논문 재현 스크립트 (v5: CV 가드/공정 백업 + t<w 판정 스킵)")
