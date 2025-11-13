@@ -221,7 +221,8 @@ def _select_action_with_mask(
 
     logits = policy(state.to(device))  # (1, num_actions)
     logits = logits.clone()
-    logits[~valid_mask_t] = -1e9
+    # valid_mask_t: (num_actions,) -> (1, num_actions)에 브로드캐스팅
+    logits[:, ~valid_mask_t] = -1e9
 
     if step < cfg.initial_random_steps:
         # 유효한 행동 중 랜덤
@@ -428,9 +429,10 @@ def train_sac_policy(
                     # -----------------------------
                     with torch.no_grad():
                         # next-state 에서 정책 분포 계산 + 마스킹
-                        next_logits = policy(next_states_b)
+                        next_logits = policy(next_states_b)               # (B, num_actions)
                         next_logits = next_logits.clone()
-                        next_logits[~next_valid_masks_b] = -1e9
+                        next_logits = next_logits.masked_fill(~next_valid_masks_b, -1e9)
+
 
                         next_log_probs = torch.log_softmax(next_logits, dim=-1)
                         next_probs = torch.softmax(next_logits, dim=-1)
@@ -458,9 +460,9 @@ def train_sac_policy(
                     # -----------------------------
                     # 2) Actor(정책) 업데이트
                     # -----------------------------
-                    logits = policy(states_b)
+                    logits = policy(states_b)        # (B, num_actions)
                     logits = logits.clone()
-                    logits[~valid_masks_b] = -1e9
+                    logits = logits.masked_fill(~valid_masks_b, -1e9)
 
                     log_probs = torch.log_softmax(logits, dim=-1)
                     probs = torch.softmax(logits, dim=-1)
