@@ -136,6 +136,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="실험 이름 (미지정 시 run_YYYYMMDD_HHMMSS 형식으로 자동 생성)"
     )
+    parser.add_argument(
+        '--algo',
+        type=str,
+        default=MainConfig.algo,
+        choices=['pg', 'sac_discrete'],
+        help="강화학습 알고리즘 선택: 'pg'(기존 Policy Gradient) 또는 'sac_discrete'(이산 SAC)"
+    )
+    parser.add_argument(
+        '--rl_lr',
+        type=float,
+        default=MainConfig.rl_lr,
+        help="Policy Gradient(LR) 학습률 (algo='pg'일 때 사용)"
+    )
+
+
 
     return parser
 
@@ -162,5 +177,7 @@ def config_from_args(args: argparse.Namespace) -> MainConfig:
         calib_map_path=args.calib_map_path,
         policy_arch=args.policy_arch,
         outputs_dir=args.outputs_dir,
-        exp_name=args.exp_name,        
+        exp_name=args.exp_name,
+        algo=args.algo,
+        rl_lr=args.rl_lr,        
     )
