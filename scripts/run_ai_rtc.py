@@ -8,8 +8,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from runner import main   # ⬅ ai_rtc.runner 대신 runner 로
-
+from runner import main   
 
 if __name__ == "__main__":
     main()
