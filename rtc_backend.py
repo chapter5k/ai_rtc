@@ -45,7 +45,6 @@ def compute_pS0_stat(
     elif backend == 'lgbm':
         # LightGBM OOF 확률 기반 p(S0,t) 추정
         try:
-            import numpy as np
             from sklearn.model_selection import StratifiedKFold
             from lightgbm import LGBMClassifier
         except Exception as e:

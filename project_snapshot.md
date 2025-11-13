@@ -1,6 +1,6 @@
 # Project Snapshot
 
-- Generated at: `2025-11-13 12:08:46`
+- Generated at: `2025-11-13 12:28:49`
 - Root directory: `C:\Users\USER\project\ai_rtc`
 
 ## Directory Tree
@@ -118,9 +118,9 @@ def run_backend_benchmark(
 ### `cl_calib.py`
 
 ```python
-# ai_rtc/cl_calib.py
+# cl_calib.py
+
 from dataclasses import dataclass
-from typing import Dict
 import numpy as np
 from numpy.typing import NDArray
 from sklearn.utils import check_random_state
@@ -130,9 +130,10 @@ from rtc_backend import compute_pS0_stat
 from utils import _np2d, _np1d
 
 @dataclass
-class CLCalib:
-    CL: float
-    std_boot: float
+class WindowCalib:
+    """윈도우별 관리한계(CL)와 부트스트랩 표준편차를 담는 구조체."""
+    CL: float   # 관리한계 (상한선)
+    std: float  # 부트스트랩 std
 
 def estimate_CL_for_window(
     S0: NDArray,
@@ -142,14 +143,19 @@ def estimate_CL_for_window(
     n_estimators: int,
     seed: int,
     backend: str = 'sklearn',
-) -> CLCalib:
+) -> WindowCalib:
+    """
+    주어진 window 크기에 대해, 부트스트랩으로 CL(상한)을 추정.
+    반환값: WindowCalib(CL, std)
+    """
     if n_boot <= 0:
         raise ValueError("estimate_CL_for_window: n_boot must be >= 1 (CL 스킵은 main에서 로드 분기를 사용).")
     
     rng = check_random_state(seed)
-    alpha = 1.0 / 200.0
+    alpha = 1.0 / 200.0   # ARL0 ≈ 200 을 맞추기 위한 상한 분위수
     stats = []
     N0 = len(S0)
+
     pbar = tqdm(range(n_boot), desc=f"  CL Boot (w={window})", leave=False, dynamic_ncols=True)
     for _ in pbar:
         start = 0 if N0 - window <= 0 else rng.randint(0, N0 - window)
@@ -162,11 +168,10 @@ def estimate_CL_for_window(
             np.ones(len(Sw), dtype=int),
         ])
 
-        # ✅ 항상 넘파이로 통일 (DataFrame→ndarray 변환)
+        # 항상 넘파이로 통일 (DataFrame → ndarray 혼용 방지)
         X = _np2d(X, dtype=np.float32)
         y = _np1d(y, dtype=np.int32)
 
-        # CL 보정용 통계 계산
         pS0 = compute_pS0_stat(
             X, y, np.arange(len(S0)),
             d=d, n_estimators=n_estimators,
@@ -178,8 +183,8 @@ def estimate_CL_for_window(
     stats = np.asarray(stats)
     CL = np.quantile(stats, 1 - alpha)
     std_boot = float(np.std(stats, ddof=1))
-    return CLCalib(CL=CL, std_boot=std_boot)
 
+    return WindowCalib(CL=CL, std=std_boot)
 
 ```
 
@@ -837,7 +842,7 @@ from numpy.typing import NDArray
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils import check_random_state
 
-from .utils import sqrt_int, _np2d, _np1d
+from utils import sqrt_int, _np2d, _np1d
 
 # -------------------------- p(S0,t) 계산 ----------------------------
 
@@ -877,7 +882,6 @@ def compute_pS0_stat(
     elif backend == 'lgbm':
         # LightGBM OOF 확률 기반 p(S0,t) 추정
         try:
-            import numpy as np
             from sklearn.model_selection import StratifiedKFold
             from lightgbm import LGBMClassifier
         except Exception as e:
@@ -1141,7 +1145,7 @@ from cl_calib import estimate_CL_for_window, WindowCalib
 from policy_nets import build_policy, save_policy, load_policy
 from rl_pg import RLConfig, train_rl_policy
 from eval_arl import evaluate_arl1
-from benchmark import run_backend_benchmark  # 네가 만든 이름에 맞게 수정
+from benchmark import run_backend_benchmark  
 
 
 def _prepare_phase1_data(cfg: MainConfig, scen: ScenarioConfig, rng) -> NDArray:
@@ -1338,22 +1342,22 @@ def main():
 
     # 2) 시나리오/데이터 설정 (논문 기본값)
     scen = ScenarioConfig(d=10, N0=1500, T=300, shift_time=100, sigma=1.0)
-
-    # (선택) 백엔드 벤치마크
-    try:
-        from .benchmark import run_backend_benchmark
-        run_backend_benchmark(
-            d=scen.d,
-            N0=scen.N0,
-            backend=cfg.rf_backend,
-            guess_arl1=cfg.guess_arl1,
-            n_estimators=cfg.n_estimators_eval,
-        )
-    except Exception as e:
-        print(f"[벤치마크] 실패 (무시해도 됨): {e}")
-
+    
     # 3) Phase I 데이터 준비
     S0_ref = _prepare_phase1_data(cfg, scen, rng)
+
+    # ✅ (선택) 백엔드 벤치마크 - 정상 버전
+    try:
+        elapsed = run_backend_benchmark(
+            S0_ref=S0_ref,
+            d=scen.d,
+            n_estimators=cfg.n_estimators_eval,
+            seed=cfg.seed,
+            backend=cfg.rf_backend,
+        )
+        print(f"[벤치마크] backend='{cfg.rf_backend}' 기준 1회 통계 계산 시간 ≈ {elapsed:.3f} 초")
+    except Exception as e:
+        print(f"[벤치마크] 실패 (무시해도 됨): {e}")
 
     # 4) CL 보정
     calib_map = _prepare_cl_calib(cfg, scen, S0_ref)
@@ -1386,8 +1390,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from runner import main   # ⬅ ai_rtc.runner 대신 runner 로
-
+from runner import main   
 
 if __name__ == "__main__":
     main()
