@@ -1,6 +1,6 @@
 # Project Snapshot
 
-- Generated at: `2025-11-13 12:28:49`
+- Generated at: `2025-11-13 13:41:15`
 - Root directory: `C:\Users\USER\project\ai_rtc`
 
 ## Directory Tree
@@ -21,6 +21,7 @@
   rtc_backend.py
   runner.py
   utils.py
+  ~$크립트 실행.docx
   스크립트 실행.docx
 
 scripts/

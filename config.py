@@ -10,6 +10,8 @@ import torch
 
 RfBackend = Literal["sklearn", "cuml_cv", "lgbm"]
 PolicyArch = Literal["cnn", "cnn_lstm"]
+AlgoType = Literal["pg", "sac_discrete"]
+
 
 @dataclass
 class MainConfig:
@@ -27,9 +29,11 @@ class MainConfig:
     policy_out: Optional[str] = None
     S0_ref_path: str = ""
     calib_map_path: str = ""
-    policy_arch: PolicyArch = "cnn_lstm"   # 2단계까지 했으니 기본값 cnn_lstm 로 잡아도 됨
     outputs_dir: str = "outputs"          # 결과 루트 폴더
     exp_name: Optional[str] = None        # 실험 이름 (없으면 timestamp로 자동 생성)
+    policy_arch: Literal["cnn", "cnn_lstm"] = "cnn_lstm"
+    algo: Literal["pg", "sac_discrete"] = "pg"   # 기본값 PG
+    rl_lr: float = 1e-3
     
 def build_arg_parser() -> argparse.ArgumentParser:
     """CLI 인자 정의 (원래 ai_rtc_251103_v4.py에 있던 argparse 부분)."""

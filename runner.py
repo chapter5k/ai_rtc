@@ -26,6 +26,9 @@ from rl_pg import RLConfig, train_rl_policy
 from eval_arl import evaluate_arl1
 from benchmark import run_backend_benchmark  
 
+from rl_pg import train_rl_policy
+from rl_sac import train_sac_policy, SACConfig
+
 
 def _prepare_phase1_data(cfg: MainConfig, scen: ScenarioConfig, rng) -> NDArray:
     """S0_ref (Phase I 기준 데이터)를 불러오거나 새로 생성."""
@@ -85,15 +88,23 @@ def _train_policy(
     calib_map: Dict[int, WindowCalib],
     S0_ref: NDArray,
 ) -> torch.nn.Module:
-    """정책 네트워크 생성 + RL 학습."""
+    """정책 네트워크 생성 + RL 학습 (PG 또는 SAC)."""
     device = cfg.device
     action_set = cfg.action_set
 
+    # -------------------------------
     # 1) 정책 네트워크 생성
-    policy = build_policy(cfg.policy_arch, d=scen.d, num_actions=len(action_set))
+    # -------------------------------
+    policy = build_policy(
+        cfg.policy_arch,
+        d=scen.d,
+        num_actions=len(action_set)
+    )
     policy.to(device)
 
+    # -------------------------------
     # 2) 기존 가중치 로드 (선택)
+    # -------------------------------
     if cfg.policy_in and os.path.exists(cfg.policy_in):
         print(f"[RL] 기존 정책 로드: {cfg.policy_in}")
         policy = load_policy(
@@ -104,28 +115,59 @@ def _train_policy(
             arch=cfg.policy_arch,
         )
 
-    # 3) RL 학습
-    rl_cfg = RLConfig(
-        action_set=action_set,
-        episodes=cfg.episodes,
-        device=device,
-    )
-    optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+    # -------------------------------
+    # 3) RL 학습 (PG 또는 SAC)
+    # -------------------------------
+    if cfg.algo == "pg":
+        # 기존 PG 경로
+        rl_cfg = RLConfig(
+            action_set=action_set,
+            episodes=cfg.episodes,
+            device=device,
+        )
+        optimizer = optim.Adam(policy.parameters(), lr=cfg.rl_lr)
 
-    print(f"[RL] Policy Gradient 학습 시작 (episodes={cfg.episodes})")
-    policy = train_rl_policy(
-        policy=policy,
-        optimizer=optimizer,
-        cfg=rl_cfg,
-        scen=scen,
-        calib_map=calib_map,
-        S0_ref=S0_ref,
-        seed=cfg.seed,
-        rf_backend=cfg.rf_backend,
-        n_estimators_eval=cfg.n_estimators_eval,
-    )
+        print(f"[RL] Policy Gradient 학습 시작 (episodes={cfg.episodes})")
 
+        policy = train_rl_policy(
+            policy=policy,
+            optimizer=optimizer,
+            cfg=rl_cfg,
+            scen=scen,
+            calib_map=calib_map,
+            S0_ref=S0_ref,
+            seed=cfg.seed,
+            rf_backend=cfg.rf_backend,
+            n_estimators_eval=cfg.n_estimators_eval,
+        )
+
+    elif cfg.algo == "sac_discrete":
+        # SAC 이산 경로
+        print(f"[RL] SAC(Discrete) 학습 시작 (episodes={cfg.episodes})")
+
+        sac_cfg = SACConfig(
+            action_set=tuple(cfg.action_set),
+            episodes=cfg.episodes,
+            device=device,
+        )
+
+        policy = train_sac_policy(
+            policy=policy,
+            sac_cfg=sac_cfg,
+            scen=scen,
+            calib_map=calib_map,
+            S0_ref=S0_ref,
+            seed=cfg.seed,
+            rf_backend=cfg.rf_backend,
+            n_estimators_eval=cfg.n_estimators_eval,
+        )
+
+    else:
+        raise ValueError(f"Unknown cfg.algo '{cfg.algo}'. (지원: 'pg', 'sac_discrete')")
+
+    # -------------------------------
     # 4) 학습된 정책 저장 (선택)
+    # -------------------------------
     if cfg.policy_out:
         os.makedirs(os.path.dirname(cfg.policy_out), exist_ok=True)
         save_policy(policy, cfg.policy_out)
