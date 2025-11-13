@@ -221,22 +221,22 @@ def main():
 
     # 2) 시나리오/데이터 설정 (논문 기본값)
     scen = ScenarioConfig(d=10, N0=1500, T=300, shift_time=100, sigma=1.0)
-
-    # (선택) 백엔드 벤치마크
-    try:
-        from .benchmark import run_backend_benchmark
-        run_backend_benchmark(
-            d=scen.d,
-            N0=scen.N0,
-            backend=cfg.rf_backend,
-            guess_arl1=cfg.guess_arl1,
-            n_estimators=cfg.n_estimators_eval,
-        )
-    except Exception as e:
-        print(f"[벤치마크] 실패 (무시해도 됨): {e}")
-
+    
     # 3) Phase I 데이터 준비
     S0_ref = _prepare_phase1_data(cfg, scen, rng)
+
+    # ✅ (선택) 백엔드 벤치마크 - 정상 버전
+    try:
+        elapsed = run_backend_benchmark(
+            S0_ref=S0_ref,
+            d=scen.d,
+            n_estimators=cfg.n_estimators_eval,
+            seed=cfg.seed,
+            backend=cfg.rf_backend,
+        )
+        print(f"[벤치마크] backend='{cfg.rf_backend}' 기준 1회 통계 계산 시간 ≈ {elapsed:.3f} 초")
+    except Exception as e:
+        print(f"[벤치마크] 실패 (무시해도 됨): {e}")
 
     # 4) CL 보정
     calib_map = _prepare_cl_calib(cfg, scen, S0_ref)

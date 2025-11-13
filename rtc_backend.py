@@ -5,7 +5,7 @@ from numpy.typing import NDArray
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils import check_random_state
 
-from .utils import sqrt_int, _np2d, _np1d
+from utils import sqrt_int, _np2d, _np1d
 
 # -------------------------- p(S0,t) 계산 ----------------------------
 
