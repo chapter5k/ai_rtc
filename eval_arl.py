@@ -18,6 +18,7 @@ from utils import _np2d, _np1d
 from rl_pg import make_state_tensor        # 상태 텐서 만드는 함수
 
 
+
 def run_length_until_alarm(
     X: NDArray,
     S0_ref: NDArray,
@@ -96,6 +97,50 @@ def run_length_until_alarm(
         pass
     return T
         
+def evaluate_arl0(
+    scen_cfg: ScenarioConfig,
+    scenario: str,
+    policy: PolicyCNN,
+    actions: List[int],
+    calib_map: Dict[int, WindowCalib],
+    S0_ref: NDArray,
+    R: int,
+    seed: int,
+    rf_backend: str = 'sklearn',
+    n_estimators_eval: int = 150,
+) -> Tuple[float, float]:
+    """
+    ARL0(정상 상태에서의 평균 Run Length)를 시뮬레이션으로 추정.
+
+    - Phase II 전체 구간이 in-control 이 되도록 shift_time을 T로 밀어버린 뒤,
+    - lam=0.0 으로 make_phase2_series 를 여러 번 생성해 run_length_until_alarm 의 평균을 구함.
+    """
+    rng = check_random_state(seed)
+    RLs: List[int] = []
+
+    # shift_time=T 로 설정하여 변화가 아예 발생하지 않도록 만든다.
+    scen_cfg_ic = _replace(scen_cfg, shift_time=scen_cfg.T)
+
+    pbar = tqdm(range(R), desc="  ARL0 sim", leave=False, dynamic_ncols=True)
+    for _ in pbar:
+        # lam=0.0 이면 scenario I/II 상관없이 mean shift 없음
+        X, labels_ic = make_phase2_series(scen_cfg_ic, rng, scenario, lam=0.0)
+
+        rl = run_length_until_alarm(
+            X=X,
+            S0_ref=S0_ref,
+            policy=policy,
+            actions=actions,
+            calib_map=calib_map,
+            d=scen_cfg_ic.d,
+            rf_backend=rf_backend,
+            n_estimators_eval=n_estimators_eval,
+        )
+        RLs.append(rl)
+
+    mean = float(np.mean(RLs))
+    std = float(np.std(RLs, ddof=1))
+    return mean, std
 
 def evaluate_arl1(
     scen_cfg: ScenarioConfig,

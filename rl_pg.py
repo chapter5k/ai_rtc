@@ -16,6 +16,7 @@ from utils import _np2d, _np1d
 from data_gen import ScenarioConfig, make_phase2_series
 from cl_calib import WindowCalib
 from rtc_backend import compute_pS0_stat
+from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper
 
 
 
@@ -26,6 +27,7 @@ class RLConfig:
     gamma: float = 0.99
     episodes: int = 50
     device: str = 'cpu'
+    reward: str = "alg1"
     
 
 def make_state_tensor(windowed: NDArray, d: int, L: int = 15) -> torch.Tensor:
@@ -84,6 +86,9 @@ def train_rl_policy(
 
     pbar_ep = tqdm(range(cfg.episodes), desc="[RL] Training", dynamic_ncols=True)
     for ep in pbar_ep:
+        morl_cfg = MorlConfig()
+        morl_stats = MorlStats()
+        morl_ep_state = MorlEpisodeState()        
         lam_choices_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
         lam_choices_II = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
         if rng.rand() < 0.5:
@@ -149,12 +154,41 @@ def train_rl_policy(
             logps.append(m.log_prob(a_idx_tensor))
 
             # --- 보상(유효 행동의 로컬 인덱스 기준) ---
-            if a_idx not in valid_indices:
-                rewards.append(-2.0)  # 방어적 패널티(원칙적으로 발생하지 않음)
-            else:
-                local_idx = valid_indices.index(a_idx)
-                ic = bool(labels_ic[t-1] == 1)
-                rewards.append(float(reward_by_algorithm1(local_idx, D_list, in_control=ic)))
+            # --- 보상 계산 ---
+            ic = bool(labels_ic[t-1] == 1)
+
+            if cfg.reward == "alg1":
+                r_t = calc_reward_alg1_wrapper(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                )
+                rewards.append(float(r_t))
+            else:  # cfg.reward == "morl"
+                # 선택된 행동의 D 값(selected_D) 추출
+                if a_idx not in valid_indices:
+                    # 이론상 거의 없음. 방어적 처리.
+                    selected_D = 0.0
+                else:
+                    local_idx = valid_indices.index(a_idx)
+                    selected_D = float(D_list[local_idx])
+
+                r_t, comps = calc_reward_morl(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                    t=t,
+                    shift_time=scen.shift_time,
+                    selected_D=selected_D,
+                    episode_state=morl_ep_state,
+                    stats=morl_stats,
+                    cfg=morl_cfg,
+                )
+                # comps(dict)는 원하면 디버그/로그에 활용 가능
+                rewards.append(float(r_t))
+
 
         # --- Policy Gradient 업데이트 ---
         pbar_ep.set_postfix_str("Updating policy.")

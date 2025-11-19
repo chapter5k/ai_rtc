@@ -33,6 +33,8 @@ from data_gen import ScenarioConfig, make_phase2_series
 from cl_calib import WindowCalib
 from rtc_backend import compute_pS0_stat
 from rl_pg import make_state_tensor, reward_by_algorithm1
+from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper
+
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +77,7 @@ class SACConfig:
     updates_per_step: int = 1
 
     target_entropy: float | None = None  # None이면 -log(num_actions) 로 설정
+    reward: str = "alg1"
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +269,10 @@ def train_sac_policy(
     반환:
       - 학습된 policy (in-place update)
     """
+    # 전역 MORL 통계 (에피소드 전체 공유)
+    morl_cfg = MorlConfig()
+    morl_stats = MorlStats()    
+    
     rng = check_random_state(seed)
     device = sac_cfg.device
 
@@ -311,6 +318,8 @@ def train_sac_policy(
 
     for ep in pbar_ep:
         # --- 시나리오/쉬프트 크기 샘플링 (PG 코드와 동일 패턴) ---
+        morl_ep_state = MorlEpisodeState()
+        
         lam_choices_I = [np.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
         lam_choices_II = [np.sqrt(x) for x in [2, 3, 5, 7, 9]]
 
@@ -383,14 +392,37 @@ def train_sac_policy(
                 cfg=sac_cfg,
             )
 
-            # --- 보상 계산 (기존 reward_by_algorithm1 재사용) ---
-            if a_idx not in valid_indices:
-                reward = -2.0  # 방어적 패널티(이론상 거의 발생 X)
-            else:
-                local_idx = valid_indices.index(a_idx)
-                ic = bool(labels_ic[t - 1] == 1)
-                reward = float(reward_by_algorithm1(local_idx, D_list, in_control=ic))
-            ep_rewards.append(reward)
+            # --- 보상 계산  ---
+            ic = bool(labels_ic[t - 1] == 1)
+
+            if sac_cfg.reward == "alg1":
+                reward = calc_reward_alg1_wrapper(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                )
+            else:  # 'morl'
+                if a_idx not in valid_indices:
+                    selected_D = 0.0
+                else:
+                    local_idx = valid_indices.index(a_idx)
+                    selected_D = float(D_list[local_idx])
+
+                reward, comps = calc_reward_morl(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                    t=t,
+                    shift_time=scen.shift_time,
+                    selected_D=selected_D,
+                    episode_state=morl_ep_state,
+                    stats=morl_stats,
+                    cfg=morl_cfg,
+                )
+            ep_rewards.append(float(reward))
+
 
             # --- 다음 상태 구성 ---
             done = (t == scen.T)

@@ -11,7 +11,7 @@ import torch
 RfBackend = Literal["sklearn", "cuml_cv", "lgbm"]
 PolicyArch = Literal["cnn", "cnn_lstm"]
 AlgoType = Literal["pg", "sac_discrete"]
-
+RewardType = Literal["alg1", "morl"]   #
 
 @dataclass
 class MainConfig:
@@ -34,6 +34,7 @@ class MainConfig:
     policy_arch: Literal["cnn", "cnn_lstm"] = "cnn_lstm"
     algo: Literal["pg", "sac_discrete"] = "pg"   # 기본값 PG
     rl_lr: float = 1e-3
+    reward: RewardType = "alg1"
     
 def build_arg_parser() -> argparse.ArgumentParser:
     """CLI 인자 정의 (원래 ai_rtc_251103_v4.py에 있던 argparse 부분)."""
@@ -149,7 +150,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=MainConfig.rl_lr,
         help="Policy Gradient(LR) 학습률 (algo='pg'일 때 사용)"
     )
-
+    parser.add_argument(
+        '--reward',
+        type=str,
+        default="alg1",
+        choices=['alg1', 'morl'],
+        help="보상 설계: 'alg1'(논문 Algorithm 1), 'morl'(ARL0/ARL1 트레이드오프용 MORL 스칼라화)"
+    )
 
 
     return parser
@@ -179,5 +186,6 @@ def config_from_args(args: argparse.Namespace) -> MainConfig:
         outputs_dir=args.outputs_dir,
         exp_name=args.exp_name,
         algo=args.algo,
-        rl_lr=args.rl_lr,        
+        rl_lr=args.rl_lr,
+        reward=args.reward,
     )

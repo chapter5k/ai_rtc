@@ -1,6 +1,6 @@
 # Project Snapshot
 
-- Generated at: `2025-11-13 14:05:01`
+- Generated at: `2025-11-19 16:55:44`
 - Root directory: `C:\Users\USER\project\ai_rtc`
 
 ## Directory Tree
@@ -17,6 +17,7 @@
   policy_nets.py
   project_snapshot.md
   requirements.txt
+  reward_morl.py
   rl_pg.py
   rl_sac.py
   rtc_backend.py
@@ -206,7 +207,7 @@ import torch
 RfBackend = Literal["sklearn", "cuml_cv", "lgbm"]
 PolicyArch = Literal["cnn", "cnn_lstm"]
 AlgoType = Literal["pg", "sac_discrete"]
-
+RewardType = Literal["alg1", "morl"]   #
 
 @dataclass
 class MainConfig:
@@ -229,6 +230,7 @@ class MainConfig:
     policy_arch: Literal["cnn", "cnn_lstm"] = "cnn_lstm"
     algo: Literal["pg", "sac_discrete"] = "pg"   # 기본값 PG
     rl_lr: float = 1e-3
+    reward: RewardType = "alg1"
     
 def build_arg_parser() -> argparse.ArgumentParser:
     """CLI 인자 정의 (원래 ai_rtc_251103_v4.py에 있던 argparse 부분)."""
@@ -331,6 +333,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="실험 이름 (미지정 시 run_YYYYMMDD_HHMMSS 형식으로 자동 생성)"
     )
+    parser.add_argument(
+        '--algo',
+        type=str,
+        default=MainConfig.algo,
+        choices=['pg', 'sac_discrete'],
+        help="강화학습 알고리즘 선택: 'pg'(기존 Policy Gradient) 또는 'sac_discrete'(이산 SAC)"
+    )
+    parser.add_argument(
+        '--rl_lr',
+        type=float,
+        default=MainConfig.rl_lr,
+        help="Policy Gradient(LR) 학습률 (algo='pg'일 때 사용)"
+    )
+    parser.add_argument(
+        '--reward',
+        type=str,
+        default="alg1",
+        choices=['alg1', 'morl'],
+        help="보상 설계: 'alg1'(논문 Algorithm 1), 'morl'(ARL0/ARL1 트레이드오프용 MORL 스칼라화)"
+    )
+
 
     return parser
 
@@ -357,7 +380,10 @@ def config_from_args(args: argparse.Namespace) -> MainConfig:
         calib_map_path=args.calib_map_path,
         policy_arch=args.policy_arch,
         outputs_dir=args.outputs_dir,
-        exp_name=args.exp_name,        
+        exp_name=args.exp_name,
+        algo=args.algo,
+        rl_lr=args.rl_lr,
+        reward=args.reward,
     )
 ```
 
@@ -435,6 +461,7 @@ from cl_calib import WindowCalib
 from rtc_backend import compute_pS0_stat
 from utils import _np2d, _np1d
 from rl_pg import make_state_tensor        # 상태 텐서 만드는 함수
+
 
 
 def run_length_until_alarm(
@@ -515,6 +542,50 @@ def run_length_until_alarm(
         pass
     return T
         
+def evaluate_arl0(
+    scen_cfg: ScenarioConfig,
+    scenario: str,
+    policy: PolicyCNN,
+    actions: List[int],
+    calib_map: Dict[int, WindowCalib],
+    S0_ref: NDArray,
+    R: int,
+    seed: int,
+    rf_backend: str = 'sklearn',
+    n_estimators_eval: int = 150,
+) -> Tuple[float, float]:
+    """
+    ARL0(정상 상태에서의 평균 Run Length)를 시뮬레이션으로 추정.
+
+    - Phase II 전체 구간이 in-control 이 되도록 shift_time을 T로 밀어버린 뒤,
+    - lam=0.0 으로 make_phase2_series 를 여러 번 생성해 run_length_until_alarm 의 평균을 구함.
+    """
+    rng = check_random_state(seed)
+    RLs: List[int] = []
+
+    # shift_time=T 로 설정하여 변화가 아예 발생하지 않도록 만든다.
+    scen_cfg_ic = _replace(scen_cfg, shift_time=scen_cfg.T)
+
+    pbar = tqdm(range(R), desc="  ARL0 sim", leave=False, dynamic_ncols=True)
+    for _ in pbar:
+        # lam=0.0 이면 scenario I/II 상관없이 mean shift 없음
+        X, labels_ic = make_phase2_series(scen_cfg_ic, rng, scenario, lam=0.0)
+
+        rl = run_length_until_alarm(
+            X=X,
+            S0_ref=S0_ref,
+            policy=policy,
+            actions=actions,
+            calib_map=calib_map,
+            d=scen_cfg_ic.d,
+            rf_backend=rf_backend,
+            n_estimators_eval=n_estimators_eval,
+        )
+        RLs.append(rl)
+
+    mean = float(np.mean(RLs))
+    std = float(np.std(RLs, ddof=1))
+    return mean, std
 
 def evaluate_arl1(
     scen_cfg: ScenarioConfig,
@@ -642,6 +713,193 @@ def load_policy(path: str, d: int, num_actions: int, device: str, arch: str = 'c
 
 ```
 
+### `reward_morl.py`
+
+```python
+# ai_rtc/reward_morl.py
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+import numpy as np
+
+# 기존 Algorithm 1 보상과 호환되도록 import
+from rl_pg import reward_by_algorithm1
+
+
+@dataclass
+class RunningStat:
+    """러닝 Z-정규화를 위한 1D 통계 추적기."""
+    mean: float = 0.0
+    var: float = 1.0
+    count: int = 0
+
+    def update(self, x: float):
+        self.count += 1
+        if self.count == 1:
+            self.mean = x
+            self.var = 1.0
+            return
+        # Welford
+        delta = x - self.mean
+        self.mean += delta / self.count
+        self.var += delta * (x - self.mean)
+
+    def z(self, x: float) -> float:
+        denom = max(1e-6, float(np.sqrt(max(self.var, 1e-6))))
+        return float((x - self.mean) / denom)
+
+
+@dataclass
+class MorlStats:
+    """각 보상 컴포넌트별 런닝 통계."""
+    sens: RunningStat = field(default_factory=RunningStat)
+    stab: RunningStat = field(default_factory=RunningStat)
+    shape: RunningStat = field(default_factory=RunningStat)
+
+
+@dataclass
+class MorlConfig:
+    """
+    MORL 스칼라 보상 설정.
+
+    w_sens  : 탐지 민감도(ARL1 감소) 쪽 가중치
+    w_stab  : 안정성(ARL0 유지, false alarm 회피) 가중치(보통 음수 또는 -값에 곱)
+    w_shape : Algorithm1 기반 shaping 가중치
+    c_detect: 탐지 성공 시 기본 보상
+    k_delay : 탐지 지연 패널티 계수
+    """
+    w_sens: float = 1.0
+    w_stab: float = 1.0
+    w_shape: float = 0.3
+    c_detect: float = 1.0
+    k_delay: float = 0.01
+
+
+@dataclass
+class MorlEpisodeState:
+    """에피소드 단위로 유지하는 MORL 내부 상태."""
+    detection_step: int | None = None   # 첫 '탐지' 시점 (CL을 넘은 첫 t)
+    false_alarm: bool = False           # shift_time 이전에 탐지 발생 여부
+
+
+def calc_reward_alg1_wrapper(
+    action_global_idx: int,
+    valid_indices: List[int],
+    D_list: List[float],
+    in_control: bool,
+) -> float:
+    """기존 Algorithm 1과 완전히 동일한 보상 계산 (fallback용)."""
+    if action_global_idx not in valid_indices:
+        return -2.0  # 방어적 패널티
+    local_idx = valid_indices.index(action_global_idx)
+    return float(reward_by_algorithm1(local_idx, D_list, in_control=in_control))
+
+
+def calc_reward_morl(
+    *,
+    action_global_idx: int,
+    valid_indices: List[int],
+    D_list: List[float],
+    in_control: bool,
+    t: int,
+    shift_time: int,
+    selected_D: float,
+    episode_state: MorlEpisodeState,
+    stats: MorlStats,
+    cfg: MorlConfig,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    MORL 스칼라 보상 계산.
+
+    Parameters
+    ----------
+    action_global_idx : 전체 action_set에서의 인덱스 (0,1,2)
+    valid_indices     : 현재 시점에서 유효한 행동들의 global index 리스트
+    D_list            : 유효 행동별 D=(CL - pS0)/std 값 리스트 (valid_indices 순서)
+    in_control        : 현재 시점이 IC(True)인지 OOC(False)인지
+    t                 : 현재 시간(step)
+    shift_time        : OOC 시작 시점 (ScenarioConfig.shift_time)
+    selected_D        : 에이전트가 실제로 선택한 행동의 D 값
+    episode_state     : 에피소드 전역 MORL 상태 (탐지/false alarm 기록)
+    stats             : 각 보상 컴포넌트별 러닝 통계
+    cfg               : MorlConfig (가중치 등)
+    """
+
+    # ---------------------------
+    # 1) 기본 shaping: Algorithm1
+    # ---------------------------
+    r_shape = calc_reward_alg1_wrapper(
+        action_global_idx=action_global_idx,
+        valid_indices=valid_indices,
+        D_list=D_list,
+        in_control=in_control,
+    )
+
+    # ---------------------------
+    # 2) 안정성 측면 (IC 구간)
+    # ---------------------------
+    # D = (CL - pS0) / std 이므로, D가 작을수록 CL에 근접/초과 (알람 위험 ↑)
+    # IC 구간에서 D_selected가 0 근처/음수이면 false alarm 위험 → penalty
+    r_stab = 0.0
+    if in_control:
+        # soft penalty: D_selected가 1 아래로 내려오면 점점 더 큰 penalty
+        margin = max(0.0, 1.0 - selected_D)  # selected_D <= 1 -> 양수
+        r_stab = -margin   # 안정성 기준으로는 마진이 클수록 나쁨(음수 보상)
+
+    # ---------------------------
+    # 3) 탐지 민감도 (OOC 구간)
+    # ---------------------------
+    r_sens = 0.0
+    if (not in_control) and (not episode_state.false_alarm):
+        # OOC 구간에서, D_selected가 0 이하(이미 CL을 넘었다고 가정)면 "탐지"로 처리
+        if selected_D <= 0.0 and episode_state.detection_step is None:
+            episode_state.detection_step = t
+            # detection_delay = t - shift_time (0 이상)
+            detection_delay = max(0, t - shift_time)
+            r_sens = cfg.c_detect - cfg.k_delay * float(detection_delay)
+        else:
+            r_sens = 0.0
+
+    # ---------------------------
+    # 4) False Alarm 체크
+    # ---------------------------
+    # shift_time 이전에 D_selected <= 0 이면 False Alarm 으로 간주
+    if in_control and (t < shift_time) and (selected_D <= 0.0):
+        episode_state.false_alarm = True
+
+    # ---------------------------
+    # 5) 러닝 Z-정규화
+    # ---------------------------
+    stats.sens.update(r_sens)
+    stats.stab.update(r_stab)
+    stats.shape.update(r_shape)
+
+    z_sens = stats.sens.z(r_sens)
+    z_stab = stats.stab.z(r_stab)
+    z_shape = stats.shape.z(r_shape)
+
+    # ---------------------------
+    # 6) 최종 스칼라 보상 (가중합)
+    # ---------------------------
+    reward = (
+        cfg.w_sens * z_sens +
+        cfg.w_stab * z_stab +
+        cfg.w_shape * z_shape
+    )
+
+    components = {
+        "Rsensitivity_raw": r_sens,
+        "Pstability_raw": r_stab,
+        "Rshape_raw": r_shape,
+        "Rsensitivity_z": z_sens,
+        "Pstability_z": z_stab,
+        "Rshape_z": z_shape,
+    }
+    return float(reward), components
+
+```
+
 ### `rl_pg.py`
 
 ```python
@@ -663,6 +921,7 @@ from utils import _np2d, _np1d
 from data_gen import ScenarioConfig, make_phase2_series
 from cl_calib import WindowCalib
 from rtc_backend import compute_pS0_stat
+from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper
 
 
 
@@ -673,6 +932,7 @@ class RLConfig:
     gamma: float = 0.99
     episodes: int = 50
     device: str = 'cpu'
+    reward: str = "alg1"
     
 
 def make_state_tensor(windowed: NDArray, d: int, L: int = 15) -> torch.Tensor:
@@ -731,6 +991,9 @@ def train_rl_policy(
 
     pbar_ep = tqdm(range(cfg.episodes), desc="[RL] Training", dynamic_ncols=True)
     for ep in pbar_ep:
+        morl_cfg = MorlConfig()
+        morl_stats = MorlStats()
+        morl_ep_state = MorlEpisodeState()        
         lam_choices_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
         lam_choices_II = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
         if rng.rand() < 0.5:
@@ -796,12 +1059,41 @@ def train_rl_policy(
             logps.append(m.log_prob(a_idx_tensor))
 
             # --- 보상(유효 행동의 로컬 인덱스 기준) ---
-            if a_idx not in valid_indices:
-                rewards.append(-2.0)  # 방어적 패널티(원칙적으로 발생하지 않음)
-            else:
-                local_idx = valid_indices.index(a_idx)
-                ic = bool(labels_ic[t-1] == 1)
-                rewards.append(float(reward_by_algorithm1(local_idx, D_list, in_control=ic)))
+            # --- 보상 계산 ---
+            ic = bool(labels_ic[t-1] == 1)
+
+            if cfg.reward == "alg1":
+                r_t = calc_reward_alg1_wrapper(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                )
+                rewards.append(float(r_t))
+            else:  # cfg.reward == "morl"
+                # 선택된 행동의 D 값(selected_D) 추출
+                if a_idx not in valid_indices:
+                    # 이론상 거의 없음. 방어적 처리.
+                    selected_D = 0.0
+                else:
+                    local_idx = valid_indices.index(a_idx)
+                    selected_D = float(D_list[local_idx])
+
+                r_t, comps = calc_reward_morl(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                    t=t,
+                    shift_time=scen.shift_time,
+                    selected_D=selected_D,
+                    episode_state=morl_ep_state,
+                    stats=morl_stats,
+                    cfg=morl_cfg,
+                )
+                # comps(dict)는 원하면 디버그/로그에 활용 가능
+                rewards.append(float(r_t))
+
 
         # --- Policy Gradient 업데이트 ---
         pbar_ep.set_postfix_str("Updating policy.")
@@ -876,6 +1168,8 @@ from data_gen import ScenarioConfig, make_phase2_series
 from cl_calib import WindowCalib
 from rtc_backend import compute_pS0_stat
 from rl_pg import make_state_tensor, reward_by_algorithm1
+from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper
+
 
 
 # ---------------------------------------------------------------------------
@@ -918,6 +1212,7 @@ class SACConfig:
     updates_per_step: int = 1
 
     target_entropy: float | None = None  # None이면 -log(num_actions) 로 설정
+    reward: str = "alg1"
 
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1359,8 @@ def _select_action_with_mask(
 
     logits = policy(state.to(device))  # (1, num_actions)
     logits = logits.clone()
-    logits[~valid_mask_t] = -1e9
+    # valid_mask_t: (num_actions,) -> (1, num_actions)에 브로드캐스팅
+    logits[:, ~valid_mask_t] = -1e9
 
     if step < cfg.initial_random_steps:
         # 유효한 행동 중 랜덤
@@ -1108,6 +1404,10 @@ def train_sac_policy(
     반환:
       - 학습된 policy (in-place update)
     """
+    # 전역 MORL 통계 (에피소드 전체 공유)
+    morl_cfg = MorlConfig()
+    morl_stats = MorlStats()    
+    
     rng = check_random_state(seed)
     device = sac_cfg.device
 
@@ -1153,6 +1453,8 @@ def train_sac_policy(
 
     for ep in pbar_ep:
         # --- 시나리오/쉬프트 크기 샘플링 (PG 코드와 동일 패턴) ---
+        morl_ep_state = MorlEpisodeState()
+        
         lam_choices_I = [np.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
         lam_choices_II = [np.sqrt(x) for x in [2, 3, 5, 7, 9]]
 
@@ -1225,14 +1527,37 @@ def train_sac_policy(
                 cfg=sac_cfg,
             )
 
-            # --- 보상 계산 (기존 reward_by_algorithm1 재사용) ---
-            if a_idx not in valid_indices:
-                reward = -2.0  # 방어적 패널티(이론상 거의 발생 X)
-            else:
-                local_idx = valid_indices.index(a_idx)
-                ic = bool(labels_ic[t - 1] == 1)
-                reward = float(reward_by_algorithm1(local_idx, D_list, in_control=ic))
-            ep_rewards.append(reward)
+            # --- 보상 계산  ---
+            ic = bool(labels_ic[t - 1] == 1)
+
+            if sac_cfg.reward == "alg1":
+                reward = calc_reward_alg1_wrapper(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                )
+            else:  # 'morl'
+                if a_idx not in valid_indices:
+                    selected_D = 0.0
+                else:
+                    local_idx = valid_indices.index(a_idx)
+                    selected_D = float(D_list[local_idx])
+
+                reward, comps = calc_reward_morl(
+                    action_global_idx=a_idx,
+                    valid_indices=valid_indices,
+                    D_list=D_list,
+                    in_control=ic,
+                    t=t,
+                    shift_time=scen.shift_time,
+                    selected_D=selected_D,
+                    episode_state=morl_ep_state,
+                    stats=morl_stats,
+                    cfg=morl_cfg,
+                )
+            ep_rewards.append(float(reward))
+
 
             # --- 다음 상태 구성 ---
             done = (t == scen.T)
@@ -1271,9 +1596,10 @@ def train_sac_policy(
                     # -----------------------------
                     with torch.no_grad():
                         # next-state 에서 정책 분포 계산 + 마스킹
-                        next_logits = policy(next_states_b)
+                        next_logits = policy(next_states_b)               # (B, num_actions)
                         next_logits = next_logits.clone()
-                        next_logits[~next_valid_masks_b] = -1e9
+                        next_logits = next_logits.masked_fill(~next_valid_masks_b, -1e9)
+
 
                         next_log_probs = torch.log_softmax(next_logits, dim=-1)
                         next_probs = torch.softmax(next_logits, dim=-1)
@@ -1301,9 +1627,9 @@ def train_sac_policy(
                     # -----------------------------
                     # 2) Actor(정책) 업데이트
                     # -----------------------------
-                    logits = policy(states_b)
+                    logits = policy(states_b)        # (B, num_actions)
                     logits = logits.clone()
-                    logits[~valid_masks_b] = -1e9
+                    logits = logits.masked_fill(~valid_masks_b, -1e9)
 
                     log_probs = torch.log_softmax(logits, dim=-1)
                     probs = torch.softmax(logits, dim=-1)
@@ -1665,7 +1991,7 @@ from data_gen import ScenarioConfig, gen_reference_data
 from cl_calib import estimate_CL_for_window, WindowCalib
 from policy_nets import build_policy, save_policy, load_policy
 from rl_pg import RLConfig, train_rl_policy
-from eval_arl import evaluate_arl1
+from eval_arl import evaluate_arl1, evaluate_arl0
 from benchmark import run_backend_benchmark  
 
 from rl_pg import train_rl_policy
@@ -1766,6 +2092,7 @@ def _train_policy(
             action_set=action_set,
             episodes=cfg.episodes,
             device=device,
+            reward=cfg.reward,
         )
         optimizer = optim.Adam(policy.parameters(), lr=cfg.rl_lr)
 
@@ -1791,6 +2118,7 @@ def _train_policy(
             action_set=tuple(cfg.action_set),
             episodes=cfg.episodes,
             device=device,
+            reward=cfg.reward,
         )
 
         policy = train_sac_policy(
@@ -1835,6 +2163,20 @@ def _evaluate(
     for scenario_name in ["I", "II"]:
         print(f"\n[평가] Scenario {scenario_name} (action_set={cfg.action_set})")
 
+        # --- ARL0 평가 (정상 상태) ---
+        arl0_mean, arl0_std = evaluate_arl0(
+            scen_cfg=scen,
+            scenario=scenario_name,
+            policy=policy,
+            actions=list(cfg.action_set),
+            calib_map=calib_map,
+            S0_ref=S0_ref,
+            R=cfg.R,
+            seed=cfg.seed,
+            rf_backend=cfg.rf_backend,
+            n_estimators_eval=cfg.n_estimators_eval,
+        )
+
         arl_means, arl_stds = evaluate_arl1(
             scen_cfg=scen,
             lam_list=lam_list,
@@ -1855,11 +2197,14 @@ def _evaluate(
 
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["lambda2", "lambda", "arl1_mean", "arl1_std"])
+            # 👇 컬럼 2개 추가
+            writer.writerow(["lambda2", "lambda", "arl1_mean", "arl1_std", "arl0_mean", "arl0_std"])
             for lam2, lam, mean, std in zip(lam2_list, lam_list, arl_means, arl_stds):
-                writer.writerow([lam2, lam, mean, std])
+                writer.writerow([lam2, lam, mean, std, arl0_mean, arl0_std])
 
         # ---- 콘솔 출력 ----
+        print(f"  ARL0={arl0_mean:.2f} [{arl0_std:.2f}]")
+        
         for lam2, lam, mean, std in zip(lam2_list, lam_list, arl_means, arl_stds):
             print(f"  λ²={lam2:.2f} λ={lam:.4f} ARL1={mean:.2f} [{std:.2f}]")
 

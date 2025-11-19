@@ -23,7 +23,7 @@ from data_gen import ScenarioConfig, gen_reference_data
 from cl_calib import estimate_CL_for_window, WindowCalib
 from policy_nets import build_policy, save_policy, load_policy
 from rl_pg import RLConfig, train_rl_policy
-from eval_arl import evaluate_arl1
+from eval_arl import evaluate_arl1, evaluate_arl0
 from benchmark import run_backend_benchmark  
 
 from rl_pg import train_rl_policy
@@ -124,6 +124,7 @@ def _train_policy(
             action_set=action_set,
             episodes=cfg.episodes,
             device=device,
+            reward=cfg.reward,
         )
         optimizer = optim.Adam(policy.parameters(), lr=cfg.rl_lr)
 
@@ -149,6 +150,7 @@ def _train_policy(
             action_set=tuple(cfg.action_set),
             episodes=cfg.episodes,
             device=device,
+            reward=cfg.reward,
         )
 
         policy = train_sac_policy(
@@ -193,6 +195,20 @@ def _evaluate(
     for scenario_name in ["I", "II"]:
         print(f"\n[평가] Scenario {scenario_name} (action_set={cfg.action_set})")
 
+        # --- ARL0 평가 (정상 상태) ---
+        arl0_mean, arl0_std = evaluate_arl0(
+            scen_cfg=scen,
+            scenario=scenario_name,
+            policy=policy,
+            actions=list(cfg.action_set),
+            calib_map=calib_map,
+            S0_ref=S0_ref,
+            R=cfg.R,
+            seed=cfg.seed,
+            rf_backend=cfg.rf_backend,
+            n_estimators_eval=cfg.n_estimators_eval,
+        )
+
         arl_means, arl_stds = evaluate_arl1(
             scen_cfg=scen,
             lam_list=lam_list,
@@ -213,11 +229,14 @@ def _evaluate(
 
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["lambda2", "lambda", "arl1_mean", "arl1_std"])
+            # 👇 컬럼 2개 추가
+            writer.writerow(["lambda2", "lambda", "arl1_mean", "arl1_std", "arl0_mean", "arl0_std"])
             for lam2, lam, mean, std in zip(lam2_list, lam_list, arl_means, arl_stds):
-                writer.writerow([lam2, lam, mean, std])
+                writer.writerow([lam2, lam, mean, std, arl0_mean, arl0_std])
 
         # ---- 콘솔 출력 ----
+        print(f"  ARL0={arl0_mean:.2f} [{arl0_std:.2f}]")
+        
         for lam2, lam, mean, std in zip(lam2_list, lam_list, arl_means, arl_stds):
             print(f"  λ²={lam2:.2f} λ={lam:.4f} ARL1={mean:.2f} [{std:.2f}]")
 
