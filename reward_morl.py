@@ -5,9 +5,25 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple
 import numpy as np
 
-# 기존 Algorithm 1 보상과 호환되도록 import
-from rl_pg import reward_by_algorithm1
+# 기존 Algorithm 1 보상(순위 기반)과 동일한 형태로 로컬 정의
+def reward_by_algorithm1(action_idx: int, distances: List[float], in_control: bool) -> float:
+    """
+    distances: IC 구간에서 '클수록 좋은' 점수 (예: (CL - pS0) / std)
+    action_idx: 전체 actions 중에서 에이전트가 선택한 행동의 인덱스 (0, 1, 2)
 
+    - IC(in_control=True)   : rank가 높을수록(거리 큰 행동 선택) 보상 +1, 그 외 -1, -2
+    - OOC(in_control=False) : 반대로 CL에 더 가까운 행동(탐지에 유리한 행동)을 선호
+    """
+    # 거리가 큰 순서대로 내림차순 정렬
+    order = np.argsort(distances)[::-1]
+    # 선택한 action_idx의 순위(0=최상위, 2=최하위)
+    rank = int(np.where(order == action_idx)[0][0])
+
+    if in_control:
+        table = {0: 1.0, 1: -1.0, 2: -2.0}
+    else:
+        table = {0: -2.0, 1: -1.0, 2: 1.0}
+    return float(table[rank])
 
 @dataclass
 class RunningStat:
