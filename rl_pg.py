@@ -84,10 +84,12 @@ def train_rl_policy(
             pass
     actions = list(cfg.action_set)
 
+    morl_cfg = MorlConfig()
+    morl_stats = MorlStats()
+
     pbar_ep = tqdm(range(cfg.episodes), desc="[RL] Training", dynamic_ncols=True)
     for ep in pbar_ep:
-        morl_cfg = MorlConfig()
-        morl_stats = MorlStats()
+
         morl_ep_state = MorlEpisodeState()        
         lam_choices_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
         lam_choices_II = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
