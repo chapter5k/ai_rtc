@@ -1,6 +1,6 @@
 # Project Snapshot
 
-- Generated at: `2025-11-19 16:55:44`
+- Generated at: `2025-11-19 17:22:11`
 - Root directory: `C:\Users\USER\project\ai_rtc`
 
 ## Directory Tree
@@ -723,9 +723,25 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple
 import numpy as np
 
-# 기존 Algorithm 1 보상과 호환되도록 import
-from rl_pg import reward_by_algorithm1
+# 기존 Algorithm 1 보상(순위 기반)과 동일한 형태로 로컬 정의
+def reward_by_algorithm1(action_idx: int, distances: List[float], in_control: bool) -> float:
+    """
+    distances: IC 구간에서 '클수록 좋은' 점수 (예: (CL - pS0) / std)
+    action_idx: 전체 actions 중에서 에이전트가 선택한 행동의 인덱스 (0, 1, 2)
 
+    - IC(in_control=True)   : rank가 높을수록(거리 큰 행동 선택) 보상 +1, 그 외 -1, -2
+    - OOC(in_control=False) : 반대로 CL에 더 가까운 행동(탐지에 유리한 행동)을 선호
+    """
+    # 거리가 큰 순서대로 내림차순 정렬
+    order = np.argsort(distances)[::-1]
+    # 선택한 action_idx의 순위(0=최상위, 2=최하위)
+    rank = int(np.where(order == action_idx)[0][0])
+
+    if in_control:
+        table = {0: 1.0, 1: -1.0, 2: -2.0}
+    else:
+        table = {0: -2.0, 1: -1.0, 2: 1.0}
+    return float(table[rank])
 
 @dataclass
 class RunningStat:
@@ -989,10 +1005,12 @@ def train_rl_policy(
             pass
     actions = list(cfg.action_set)
 
+    morl_cfg = MorlConfig()
+    morl_stats = MorlStats()
+
     pbar_ep = tqdm(range(cfg.episodes), desc="[RL] Training", dynamic_ncols=True)
     for ep in pbar_ep:
-        morl_cfg = MorlConfig()
-        morl_stats = MorlStats()
+
         morl_ep_state = MorlEpisodeState()        
         lam_choices_I = [math.sqrt(x) for x in [0.25, 0.5, 1, 2, 3, 5, 7, 9]]
         lam_choices_II = [math.sqrt(x) for x in [2, 3, 5, 7, 9]]
@@ -1167,8 +1185,8 @@ from torch.distributions import Categorical
 from data_gen import ScenarioConfig, make_phase2_series
 from cl_calib import WindowCalib
 from rtc_backend import compute_pS0_stat
-from rl_pg import make_state_tensor, reward_by_algorithm1
-from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper
+from rl_pg import make_state_tensor
+from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper, reward_by_algorithm1
 
 
 

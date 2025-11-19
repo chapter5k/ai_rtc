@@ -35,6 +35,7 @@ class MainConfig:
     algo: Literal["pg", "sac_discrete"] = "pg"   # 기본값 PG
     rl_lr: float = 1e-3
     reward: RewardType = "alg1"
+    target_arl0: int = 200   # CL 보정 시 목표 ARL0 (기본=200)
     
 def build_arg_parser() -> argparse.ArgumentParser:
     """CLI 인자 정의 (원래 ai_rtc_251103_v4.py에 있던 argparse 부분)."""
@@ -157,7 +158,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=['alg1', 'morl'],
         help="보상 설계: 'alg1'(논문 Algorithm 1), 'morl'(ARL0/ARL1 트레이드오프용 MORL 스칼라화)"
     )
-
+    parser.add_argument(
+        "--target_arl0",
+        type=int,
+        default=200,
+        help="CL 보정 시 목표 ARL0 (기본=200). alpha=1/ARL0 로 CL 분위수 계산"
+    )
 
     return parser
 
@@ -188,4 +194,5 @@ def config_from_args(args: argparse.Namespace) -> MainConfig:
         algo=args.algo,
         rl_lr=args.rl_lr,
         reward=args.reward,
+        target_arl0=args.target_arl0,
     )

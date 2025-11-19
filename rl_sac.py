@@ -32,8 +32,8 @@ from torch.distributions import Categorical
 from data_gen import ScenarioConfig, make_phase2_series
 from cl_calib import WindowCalib
 from rtc_backend import compute_pS0_stat
-from rl_pg import make_state_tensor, reward_by_algorithm1
-from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper
+from rl_pg import make_state_tensor
+from reward_morl import MorlConfig, MorlStats, MorlEpisodeState, calc_reward_morl, calc_reward_alg1_wrapper, reward_by_algorithm1
 
 
 

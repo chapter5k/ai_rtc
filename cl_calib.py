@@ -22,6 +22,7 @@ def estimate_CL_for_window(
     n_boot: int,
     n_estimators: int,
     seed: int,
+    target_arl0: float = 200.0,   # 👈 새 인자 (기본값 200)
     backend: str = 'sklearn',
 ) -> WindowCalib:
     """
@@ -32,7 +33,7 @@ def estimate_CL_for_window(
         raise ValueError("estimate_CL_for_window: n_boot must be >= 1 (CL 스킵은 main에서 로드 분기를 사용).")
     
     rng = check_random_state(seed)
-    alpha = 1.0 / 200.0   # ARL0 ≈ 200 을 맞추기 위한 상한 분위수
+    alpha = 1.0 / float(target_arl0)   # ARL0 ≈ 200 을 맞추기 위한 상한 분위수
     stats = []
     N0 = len(S0)
 

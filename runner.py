@@ -70,6 +70,7 @@ def _prepare_cl_calib(
             n_estimators=cfg.n_estimators_eval,
             seed=cfg.seed,
             backend=cfg.rf_backend,
+            target_arl0=cfg.target_arl0,
         )
         calib_map[w] = calib
 
