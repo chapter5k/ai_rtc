@@ -1,6 +1,6 @@
 # Project Snapshot
 
-- Generated at: `2025-11-19 17:22:11`
+- Generated at: `2025-11-20 09:45:21`
 - Root directory: `C:\Users\USER\project\ai_rtc`
 
 ## Directory Tree
@@ -145,6 +145,7 @@ def estimate_CL_for_window(
     n_boot: int,
     n_estimators: int,
     seed: int,
+    target_arl0: float = 200.0,   # 👈 새 인자 (기본값 200)
     backend: str = 'sklearn',
 ) -> WindowCalib:
     """
@@ -155,7 +156,7 @@ def estimate_CL_for_window(
         raise ValueError("estimate_CL_for_window: n_boot must be >= 1 (CL 스킵은 main에서 로드 분기를 사용).")
     
     rng = check_random_state(seed)
-    alpha = 1.0 / 200.0   # ARL0 ≈ 200 을 맞추기 위한 상한 분위수
+    alpha = 1.0 / float(target_arl0)   # ARL0 ≈ 200 을 맞추기 위한 상한 분위수
     stats = []
     N0 = len(S0)
 
@@ -231,6 +232,7 @@ class MainConfig:
     algo: Literal["pg", "sac_discrete"] = "pg"   # 기본값 PG
     rl_lr: float = 1e-3
     reward: RewardType = "alg1"
+    target_arl0: int = 200   # CL 보정 시 목표 ARL0 (기본=200)
     
 def build_arg_parser() -> argparse.ArgumentParser:
     """CLI 인자 정의 (원래 ai_rtc_251103_v4.py에 있던 argparse 부분)."""
@@ -353,7 +355,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=['alg1', 'morl'],
         help="보상 설계: 'alg1'(논문 Algorithm 1), 'morl'(ARL0/ARL1 트레이드오프용 MORL 스칼라화)"
     )
-
+    parser.add_argument(
+        "--target_arl0",
+        type=int,
+        default=200,
+        help="CL 보정 시 목표 ARL0 (기본=200). alpha=1/ARL0 로 CL 분위수 계산"
+    )
 
     return parser
 
@@ -384,6 +391,7 @@ def config_from_args(args: argparse.Namespace) -> MainConfig:
         algo=args.algo,
         rl_lr=args.rl_lr,
         reward=args.reward,
+        target_arl0=args.target_arl0,
     )
 ```
 
@@ -2056,6 +2064,7 @@ def _prepare_cl_calib(
             n_estimators=cfg.n_estimators_eval,
             seed=cfg.seed,
             backend=cfg.rf_backend,
+            target_arl0=cfg.target_arl0,
         )
         calib_map[w] = calib
 

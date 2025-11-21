@@ -1,4 +1,4 @@
-# ai_rtc/cl_calib.py
+# cl_calib.py
 
 from dataclasses import dataclass
 import numpy as np
@@ -11,49 +11,45 @@ from utils import _np2d, _np1d
 
 @dataclass
 class WindowCalib:
-    CL: float
-    std: float
+    """윈도우별 관리한계(CL)와 부트스트랩 표준편차를 담는 구조체."""
+    CL: float   # 관리한계 (상한선)
+    std: float  # 부트스트랩 std
 
 def estimate_CL_for_window(
-    S0: NDArray,          # 학습용 Reference 데이터 (Classifier 훈련용)
-    S0_calib: NDArray,    # [NEW] 보정용 데이터 (Sw 샘플링용, 누수 방지)
+    S0: NDArray,
     d: int,
     window: int,
     n_boot: int,
     n_estimators: int,
     seed: int,
-    target_arl0: float = 200.0,
+    target_arl0: float = 200.0,   # 👈 새 인자 (기본값 200)
     backend: str = 'sklearn',
 ) -> WindowCalib:
     """
     주어진 window 크기에 대해, 부트스트랩으로 CL(상한)을 추정.
-    S0_calib에서 Sw를 추출하여 Data Leakage(중복 데이터 문제)를 방지함.
+    반환값: WindowCalib(CL, std)
     """
     if n_boot <= 0:
-        raise ValueError("estimate_CL_for_window: n_boot must be >= 1")
+        raise ValueError("estimate_CL_for_window: n_boot must be >= 1 (CL 스킵은 main에서 로드 분기를 사용).")
     
     rng = check_random_state(seed)
-    alpha = 1.0 / float(target_arl0)
+    alpha = 1.0 / float(target_arl0)   # ARL0 ≈ 200 을 맞추기 위한 상한 분위수
     stats = []
-    
-    # S0가 아닌 S0_calib의 길이를 사용
-    N_calib = len(S0_calib)
+    N0 = len(S0)
 
-    # 진행바 표시
     pbar = tqdm(range(n_boot), desc=f"  CL Boot (w={window})", leave=False, dynamic_ncols=True)
     for _ in pbar:
-        # [핵심 수정] Sw를 S0_calib에서 추출
-        start = 0 if N_calib - window <= 0 else rng.randint(0, N_calib - window)
-        Sw = S0_calib[start:start + window]
+        start = 0 if N0 - window <= 0 else rng.randint(0, N0 - window)
+        Sw = S0[start:start + window]
 
-        # 학습 데이터 구성: Reference(S0) vs Current(Sw)
-        # Phase II와 동일하게 Sw는 S0와 독립적인 데이터가 됨
+        # 정상(S0) vs 비정상(Sw)
         X = np.vstack([S0, Sw])
         y = np.hstack([
             np.zeros(len(S0), dtype=int),
             np.ones(len(Sw), dtype=int),
         ])
 
+        # 항상 넘파이로 통일 (DataFrame → ndarray 혼용 방지)
         X = _np2d(X, dtype=np.float32)
         y = _np1d(y, dtype=np.int32)
 
@@ -66,7 +62,6 @@ def estimate_CL_for_window(
         stats.append(pS0)
 
     stats = np.asarray(stats)
-    # 상위 (1-alpha) 분위수를 CL로 설정
     CL = np.quantile(stats, 1 - alpha)
     std_boot = float(np.std(stats, ddof=1))
 

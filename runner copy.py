@@ -45,8 +45,6 @@ def _prepare_phase1_data(cfg: MainConfig, scen: ScenarioConfig, rng) -> NDArray:
     return S0_ref
 
 
-# ai_rtc/runner.py (해당 함수만 수정하여 교체하세요)
-
 def _prepare_cl_calib(
     cfg: MainConfig,
     scen: ScenarioConfig,
@@ -55,7 +53,6 @@ def _prepare_cl_calib(
     """윈도우별 CL 보정 수행 혹은 기존 calib_map 로드."""
     action_set = cfg.action_set
 
-    # 기존 맵 파일이 있고 부트스트랩을 안 한다면 로드
     if cfg.calib_map_path and os.path.exists(cfg.calib_map_path) and cfg.n_boot == 0:
         print(f"[CL] n_boot=0 & 기존 calib_map 사용: {cfg.calib_map_path}")
         with open(cfg.calib_map_path, "rb") as f:
@@ -63,38 +60,28 @@ def _prepare_cl_calib(
         return calib_map
 
     print(f"[CL] 부트스트랩으로 CL 추정 시작 (n_boot={cfg.n_boot})")
-    
-    # [추가] CL 보정 전용 데이터 생성 (S0_ref와 겹치지 않는 독립 시드 사용)
-    # 이 데이터는 오직 Sw(가상 윈도우)를 뽑는 데만 사용됨
-    rng_calib = check_random_state(42 + 999) 
-    print("[CL] S0_calib(보정용 데이터) 별도 생성 중... (Leakage 방지)")
-    S0_calib = gen_reference_data(scen, rng_calib) 
-
-    calib_map = {}
-    for w in action_set:
-        # [수정] S0_calib 인자 추가 전달
+    calib_map: Dict[int, WindowCalib] = {}
+    for w in tqdm(action_set, desc="[CL] window별 CL 추정"):
         calib = estimate_CL_for_window(
-            S0=S0_ref,
-            S0_calib=S0_calib,     # <--- 여기가 핵심 변경점입니다
+            S0_ref,
             d=scen.d,
             window=w,
             n_boot=cfg.n_boot,
             n_estimators=cfg.n_estimators_eval,
             seed=cfg.seed,
-            target_arl0=200.0,
             backend=cfg.rf_backend,
+            target_arl0=cfg.target_arl0,
         )
         calib_map[w] = calib
-        print(f"  > w={w}: CL={calib.CL:.4f}, std={calib.std:.4f}")
 
-    # 결과 저장
     if cfg.calib_map_path:
         os.makedirs(os.path.dirname(cfg.calib_map_path), exist_ok=True)
         with open(cfg.calib_map_path, "wb") as f:
             pickle.dump(calib_map, f)
-        print(f"[CL] calib_map 저장 완료: {cfg.calib_map_path}")
+        print(f"[CL] calib_map 저장: {cfg.calib_map_path}")
 
     return calib_map
+
 
 def _train_policy(
     cfg: MainConfig,
